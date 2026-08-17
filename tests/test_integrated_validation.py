@@ -35,7 +35,10 @@ _HOLDOUT_END = "2026-04-01T00:00:00.000000Z"
 
 
 def _plain(value: object) -> Any:
-    return json.loads(canonical_bytes(value))
+    try:
+        return json.loads(canonical_bytes(value))
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("value is not canonical JSON") from error
 
 
 def _policy(profile_ref: object) -> ValidationPolicy:
