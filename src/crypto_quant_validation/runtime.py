@@ -731,7 +731,10 @@ def _report_payload(
 
 def _failure_code(error: Exception) -> str:
     code = getattr(error, "code", None)
-    return code if type(code) is str and code else "BACKTEST_OPERATION_FAILED"
+    if type(code) is str and code:
+        return code
+    value = getattr(code, "value", None)
+    return value if type(value) is str and value else "BACKTEST_OPERATION_FAILED"
 
 
 def _require_backtest(backtest: object) -> None:
