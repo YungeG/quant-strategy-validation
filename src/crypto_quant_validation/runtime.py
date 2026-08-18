@@ -453,7 +453,14 @@ def _candidate_graph(
             training_slice = plan_payload["training_slice"]
             if type(training_slice) is not dict:
                 raise ValueError("model training slice must be an object")
+            experiment, _ = _node(
+                foundation,
+                _ref_from_wire(family_payload["experiment_ref"]),
+                "experiment_spec",
+                _RESEARCH_ARTIFACT_LOG,
+            )
             model_build = ModelBuildGraph(
+                experiment,
                 feature_recipe,
                 trainer_recipe,
                 plan_node,

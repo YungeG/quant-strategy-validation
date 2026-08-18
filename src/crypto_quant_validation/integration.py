@@ -100,6 +100,18 @@ _ANALYSIS_BASE_FIELDS = {
     "result_grade",
 }
 _TERMINAL_FIELDS = {"status", "durable_evidence_ref"}
+_EXPERIMENT_FIELDS = {
+    "hypothesis_ref",
+    "strategy_definition_ref",
+    "data_slices",
+    "parameter_combinations",
+    "seeds",
+    "scenario_refs",
+    "backtest_template_ref",
+    "model_build_plan",
+    "metric_profile_refs",
+    "budget",
+}
 _FEATURE_RECIPE_FIELDS = {
     "feature_key",
     "feature_code_hash",
@@ -426,6 +438,7 @@ class ResolvedArtifact:
 
 @dataclass(frozen=True, slots=True)
 class ModelBuildGraph:
+    experiment_spec: ResolvedArtifact
     feature_recipe: ResolvedArtifact
     trainer_recipe: ResolvedArtifact
     model_build_plan: ResolvedArtifact
@@ -438,6 +451,7 @@ class ModelBuildGraph:
 
     def __post_init__(self) -> None:
         for name in (
+            "experiment_spec",
             "feature_recipe",
             "trainer_recipe",
             "model_build_plan",
@@ -1024,6 +1038,7 @@ def _model_build_graph_valid(
     required: tuple[SampleConsumptionRecord, ...],
 ) -> bool:
     nodes = (
+        (graph.experiment_spec, _EXPERIMENT_FIELDS),
         (graph.feature_recipe, _FEATURE_RECIPE_FIELDS),
         (graph.trainer_recipe, _TRAINER_RECIPE_FIELDS),
         (graph.model_build_plan, _MODEL_BUILD_PLAN_FIELDS),
@@ -1041,6 +1056,7 @@ def _model_build_graph_valid(
             return False
         payloads.append(payload)
     (
+        experiment,
         feature_recipe,
         trainer_recipe,
         plan,
@@ -1095,6 +1111,8 @@ def _model_build_graph_valid(
     training_task_ref = graph.model_training_task.ref
     links_valid = (
         candidate.get("model_build_evidence_ref") == graph.model_build_evidence.ref
+        and graph.experiment_spec.ref == experiment_ref
+        and experiment["model_build_plan"] == graph.model_build_plan.ref
         and plan["feature_recipe_ref"] == graph.feature_recipe.ref
         and plan["trainer_recipe_ref"] == graph.trainer_recipe.ref
         and feature_task["experiment_ref"] == experiment_ref
