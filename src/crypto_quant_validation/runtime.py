@@ -22,6 +22,7 @@ from .integration import (
     CandidateGraph,
     CaseResult,
     CompletedCaseEvidence,
+    ModelBuildGraph,
     OosObservation,
     ProviderFailure,
     ProviderFailureEvidence,
@@ -133,11 +134,12 @@ def _published(
     ref: ArtifactRef,
     artifact_type: str,
     log_name: str,
+    schema_versions: tuple[int, ...] = (1,),
 ) -> dict[str, Any]:
     stored = foundation.read(ref=ref)
     if (
         stored.envelope.artifact_type != artifact_type
-        or stored.envelope.schema_version != 1
+        or stored.envelope.schema_version not in schema_versions
         or not any(
             entry.event_id == _event_id(log_name, ref)
             and entry.payload == stored.source_bytes
@@ -211,6 +213,34 @@ def _consumer_id(ref: ArtifactRef) -> str:
     return canonical_sha256(("sample-consumer-v1", ref))
 
 
+def _required_record(
+    entries: tuple[tuple[SampleConsumptionRecord, ArtifactRef, LogEntryRef], ...],
+    producer_ref: ArtifactRef,
+    data_slice: dict[str, Any],
+    purpose: str,
+    reservation_at: str,
+) -> SampleConsumptionRecord:
+    expected = SampleConsumptionRecord(
+        data_slice["dataset_revision"],
+        data_slice["interval_start"],
+        data_slice["interval_end"],
+        purpose,
+        _consumer_id(producer_ref),
+        reservation_at,
+    )
+    matches = [
+        item
+        for item, producer, _ in entries
+        if producer == producer_ref
+        and item.dataset_revision == expected.dataset_revision
+        and item.interval_start == expected.interval_start
+        and item.interval_end == expected.interval_end
+        and item.purpose == expected.purpose
+        and item.consumer_id == expected.consumer_id
+    ]
+    return matches[0] if len(matches) == 1 else expected
+
+
 def _required_records(
     entries: tuple[tuple[SampleConsumptionRecord, ArtifactRef, LogEntryRef], ...],
     trial_ref: ArtifactRef,
@@ -221,35 +251,9 @@ def _required_records(
     data_slice = trial["data_slice"]
     if type(data_slice) is not dict:
         raise ValueError("trial data slice must be an object")
-
-    def expected(ref: ArtifactRef, purpose: str) -> SampleConsumptionRecord:
-        return SampleConsumptionRecord(
-            data_slice["dataset_revision"],
-            data_slice["interval_start"],
-            data_slice["interval_end"],
-            purpose,
-            _consumer_id(ref),
-            reservation_at,
-        )
-
-    def found(
-        ref: ArtifactRef, record: SampleConsumptionRecord
-    ) -> SampleConsumptionRecord:
-        matches = [
-            item
-            for item, producer, _ in entries
-            if producer == ref
-            and item.dataset_revision == record.dataset_revision
-            and item.interval_start == record.interval_start
-            and item.interval_end == record.interval_end
-            and item.purpose == record.purpose
-            and item.consumer_id == record.consumer_id
-        ]
-        return matches[0] if len(matches) == 1 else record
-
     return (
-        found(trial_ref, expected(trial_ref, "discovery")),
-        found(selection_ref, expected(selection_ref, "selection")),
+        _required_record(entries, trial_ref, data_slice, "discovery", reservation_at),
+        _required_record(entries, selection_ref, data_slice, "selection", reservation_at),
     )
 
 
@@ -258,8 +262,11 @@ def _node(
     ref: ArtifactRef,
     artifact_type: str,
     log_name: str,
+    schema_versions: tuple[int, ...] = (1,),
 ) -> tuple[ResolvedArtifact, dict[str, Any]]:
-    payload = _published(foundation, ref, artifact_type, log_name)
+    payload = _published(
+        foundation, ref, artifact_type, log_name, schema_versions
+    )
     return ResolvedArtifact(_wire(ref), payload), payload
 
 
@@ -278,6 +285,7 @@ def _candidate_graph(
             candidate_ref,
             "strategy_candidate",
             _RESEARCH_ARTIFACT_LOG,
+            (1, 2),
         )
         family_ref = _ref_from_wire(candidate_payload["candidate_family_ref"])
         selection_ref = _ref_from_wire(candidate_payload["selection_declaration_ref"])
@@ -352,6 +360,110 @@ def _candidate_graph(
         ]
         if len(trial_outcomes) != 1 or len(analysis_outcomes) != 1:
             raise ValueError("candidate outcomes are ambiguous")
+
+        model_build: ModelBuildGraph | None = None
+        if "model_build_evidence_ref" in candidate_payload:
+            model_evidence_ref = _ref_from_wire(
+                candidate_payload["model_build_evidence_ref"]
+            )
+            model_evidence, model_evidence_payload = _node(
+                foundation,
+                model_evidence_ref,
+                "model_build_evidence",
+                _RESEARCH_ARTIFACT_LOG,
+            )
+            plan_ref = _ref_from_wire(model_evidence_payload["model_build_plan_ref"])
+            feature_manifest_ref = _ref_from_wire(
+                model_evidence_payload["feature_dataset_manifest_ref"]
+            )
+            plan_node, plan_payload = _node(
+                foundation,
+                plan_ref,
+                "model_build_plan",
+                _RESEARCH_ARTIFACT_LOG,
+            )
+            feature_recipe_ref = _ref_from_wire(plan_payload["feature_recipe_ref"])
+            trainer_recipe_ref = _ref_from_wire(plan_payload["trainer_recipe_ref"])
+            feature_recipe, _ = _node(
+                foundation,
+                feature_recipe_ref,
+                "feature_recipe",
+                _RESEARCH_ARTIFACT_LOG,
+            )
+            trainer_recipe, _ = _node(
+                foundation,
+                trainer_recipe_ref,
+                "trainer_recipe",
+                _RESEARCH_ARTIFACT_LOG,
+            )
+            feature_manifest, _ = _node(
+                foundation,
+                feature_manifest_ref,
+                "feature_dataset_manifest",
+                _RESEARCH_ARTIFACT_LOG,
+            )
+            feature_matches = [
+                (ref, node, payload)
+                for ref, node, payload in outcomes
+                if payload.get("state") == "COMPLETED"
+                and type(payload.get("task_ref")) is dict
+                and payload["task_ref"].get("kind") == "FEATURE_BUILD"
+                and payload.get("witness")
+                == {
+                    "feature_dataset_manifest": {
+                        "feature_dataset_manifest_ref": _wire(feature_manifest_ref)
+                    }
+                }
+            ]
+            training_matches = [
+                (ref, node, payload)
+                for ref, node, payload in outcomes
+                if payload.get("state") == "COMPLETED"
+                and type(payload.get("task_ref")) is dict
+                and payload["task_ref"].get("kind") == "MODEL_TRAINING"
+                and payload.get("witness")
+                == {
+                    "model_build_evidence": {
+                        "model_build_evidence_ref": _wire(model_evidence_ref)
+                    }
+                }
+            ]
+            if len(feature_matches) != 1 or len(training_matches) != 1:
+                raise ValueError("model build outcomes are ambiguous")
+            _, feature_outcome, feature_outcome_payload = feature_matches[0]
+            _, training_outcome, training_outcome_payload = training_matches[0]
+            feature_task_ref = _ref_from_wire(
+                feature_outcome_payload["task_ref"]["task_artifact_ref"]
+            )
+            training_task_ref = _ref_from_wire(
+                training_outcome_payload["task_ref"]["task_artifact_ref"]
+            )
+            feature_task, _ = _node(
+                foundation,
+                feature_task_ref,
+                "feature_build_task",
+                _RESEARCH_ARTIFACT_LOG,
+            )
+            training_task, _ = _node(
+                foundation,
+                training_task_ref,
+                "model_training_task",
+                _RESEARCH_ARTIFACT_LOG,
+            )
+            training_slice = plan_payload["training_slice"]
+            if type(training_slice) is not dict:
+                raise ValueError("model training slice must be an object")
+            model_build = ModelBuildGraph(
+                feature_recipe,
+                trainer_recipe,
+                plan_node,
+                feature_task,
+                training_task,
+                feature_manifest,
+                model_evidence,
+                feature_outcome,
+                training_outcome,
+            )
         analysis_outcome, analysis_outcome_payload = analysis_outcomes[0]
         analysis_task_ref = _ref_from_wire(
             analysis_outcome_payload["task_ref"]["task_artifact_ref"]
@@ -370,6 +482,35 @@ def _candidate_graph(
             trial_payload,
             reservation_at,
         )
+        if model_build is not None:
+            feature_task_ref = _ref_from_wire(
+                model_build.feature_build_outcome.payload["task_ref"][
+                    "task_artifact_ref"
+                ]
+            )
+            training_task_ref = _ref_from_wire(
+                model_build.model_training_outcome.payload["task_ref"][
+                    "task_artifact_ref"
+                ]
+            )
+            training_slice = model_build.model_build_plan.payload["training_slice"]
+            model_required = (
+                _required_record(
+                    entries,
+                    feature_task_ref,
+                    training_slice,
+                    "feature_build",
+                    reservation_at,
+                ),
+                _required_record(
+                    entries,
+                    training_task_ref,
+                    training_slice,
+                    "model_training",
+                    reservation_at,
+                ),
+            )
+            required_records += model_required
     except FoundationFailure:
         raise
     except Exception as error:
@@ -403,6 +544,7 @@ def _candidate_graph(
                 completed,
                 analysis,
                 required_records,
+                model_build,
             ),
             entries,
         )
@@ -881,7 +1023,9 @@ def validate_candidate(
             preflight = _preflight_admission(
                 candidate_ref, policy, graph, entries, reservation_at
             )
-    except FoundationFailure:
+    except FoundationFailure as error:
+        if error.code == "ARTIFACT_NOT_FOUND":
+            return NoReport(None, "CANDIDATE_PROVENANCE_INVALID")
         raise
     except _GraphFailure as error:
         return NoReport(None, error.code)
@@ -893,6 +1037,8 @@ def validate_candidate(
             raise AssertionError("preflight is missing")
         if preflight.reason_codes == ("CANDIDATE_PROVENANCE_INVALID",):
             return NoReport(None, "CANDIDATE_PROVENANCE_INVALID")
+        if "SAMPLE_RESERVATION_COVERAGE_MISSING" in preflight.reason_codes:
+            return NoReport(None, "SAMPLE_RESERVATION_COVERAGE_MISSING")
         snapshot_ref = sample_ledger.freeze_snapshot()
         plan = build_validation_plan(_wire(candidate_ref), _wire(snapshot_ref), policy)
         plan_ref = _publish(foundation, "validation_plan", _plan_payload(plan))

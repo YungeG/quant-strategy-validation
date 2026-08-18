@@ -7,7 +7,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from crypto_quant_domain import canonical_bytes
+from crypto_quant_domain import (
+    ArtifactEnvelope,
+    ArtifactRef,
+    canonical_bytes,
+    canonical_sha256,
+)
 from crypto_quant_validation import (
     Holdout,
     NoReport,
@@ -109,6 +114,139 @@ def _runtime(tmp_path: Path, *, market: bool = True):
         selected,
         _policy(profile_ref),
     )
+
+
+def _model_runtime(tmp_path: Path, *, missing_training_reservation: bool = False):
+    foundation, ledger, builder, provider, research_inputs, artifact = (
+        _RESEARCH._model_runtime(tmp_path / "research")
+    )
+    if missing_training_reservation:
+        reserve = ledger.reserve
+
+        def omit_training(record, producer_ref):
+            if record.purpose == "model_training":
+                return None
+            return reserve(record, producer_ref)
+
+        ledger.reserve = omit_training  # type: ignore[method-assign]
+    candidate = _RESEARCH.execute_model_experiment(
+        research_inputs,
+        foundation,
+        ledger,
+        builder,
+        provider,
+    )
+    assert type(candidate) is _RESEARCH.PublishedStrategyCandidate
+    selected = _payload(foundation, candidate.strategy_candidate_ref)
+    profile_ref = _plain(research_inputs.experiment_spec.metric_profile_refs[0])
+    prepared = _RESEARCH.backtest.prepare_model_bound_cash_development_backtest(
+        request_intent=_RESEARCH._BINDING_MODULE._intent("validation:oos:model"),
+        provider_inputs=_RESEARCH._BINDING_MODULE._provider_inputs(),
+        model_timeline=provider._timeline,
+        expected_model_key=artifact.model_key,
+        expected_artifact_ref_hash=artifact.artifact_ref_hash,
+        artifact_reader=foundation,
+        artifact_publisher=foundation,
+        market_reader=_RESEARCH._BINDING_MODULE._market_reader(),
+        publication_root=tmp_path / "research/publications",
+    )
+    provider._prepared["validation:oos:model"] = prepared
+    return (
+        foundation,
+        ledger,
+        provider,
+        candidate.strategy_candidate_ref,
+        selected,
+        _policy(profile_ref),
+    )
+
+
+def test_real_model_candidate_preserves_rejected_oos_report_and_replay(
+    tmp_path: Path,
+) -> None:
+    foundation, ledger, provider, candidate_ref, selected, policy = _model_runtime(
+        tmp_path
+    )
+    runs = provider.run_calls
+
+    first = validate_candidate(
+        candidate_ref,
+        policy,
+        {"binding_key": "validation:oos:model"},
+        _RESERVED_AT,
+        foundation,
+        ledger,
+        provider,
+    )
+    second = validate_candidate(
+        candidate_ref,
+        policy,
+        {"binding_key": "validation:oos:model"},
+        _RESERVED_AT,
+        foundation,
+        ledger,
+        provider,
+    )
+
+    assert type(first) is PublishedValidationReport
+    assert second == first
+    assert provider.run_calls == runs + 1
+    assert _payload(foundation, first.validation_report_ref)["result"] == "rejected"
+    assert "model_build_evidence_ref" in selected
+
+
+def test_model_candidate_missing_training_reservation_produces_no_report(
+    tmp_path: Path,
+) -> None:
+    foundation, ledger, provider, candidate_ref, _, policy = _model_runtime(
+        tmp_path,
+        missing_training_reservation=True,
+    )
+
+    result = validate_candidate(
+        candidate_ref,
+        policy,
+        {"binding_key": "validation:oos:model"},
+        _RESERVED_AT,
+        foundation,
+        ledger,
+        provider,
+    )
+
+    assert type(result) is NoReport
+    assert result.reason_code == "SAMPLE_RESERVATION_COVERAGE_MISSING"
+
+
+def test_model_candidate_substituted_build_evidence_produces_no_report(
+    tmp_path: Path,
+) -> None:
+    foundation, ledger, provider, _, selected, policy = _model_runtime(tmp_path)
+    forged = dict(selected)
+    forged["model_build_evidence_ref"] = ArtifactRef(
+        "model_build_evidence", 1, "sha256:" + "0" * 64
+    ).to_canonical_dict()
+    envelope = ArtifactEnvelope.create("strategy_candidate", 2, forged)
+    candidate_ref = foundation.put(envelope=envelope)
+    foundation.append(
+        "research.artifacts.v1",
+        canonical_sha256(
+            ("artifact-publication-v1", "research.artifacts.v1", candidate_ref)
+        ),
+        canonical_bytes(envelope),
+    )
+
+    result = validate_candidate(
+        candidate_ref,
+        policy,
+        {"binding_key": "validation:oos:model"},
+        _RESERVED_AT,
+        foundation,
+        ledger,
+        provider,
+    )
+
+    assert type(result) is NoReport
+    assert result.reason_code == "CANDIDATE_PROVENANCE_INVALID"
 
 
 def test_real_candidate_publishes_rejected_oos_report_and_replays(tmp_path: Path) -> None:

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-import json
-import re
 from typing import Any
 
 from .sample_consumption import (
@@ -99,6 +100,68 @@ _ANALYSIS_BASE_FIELDS = {
     "result_grade",
 }
 _TERMINAL_FIELDS = {"status", "durable_evidence_ref"}
+_FEATURE_RECIPE_FIELDS = {
+    "feature_key",
+    "feature_code_hash",
+    "feature_schema_hash",
+    "input_names",
+}
+_TRAINER_RECIPE_FIELDS = {
+    "trainer_key",
+    "training_code_hash",
+    "model_key",
+    "hyperparameters",
+}
+_MODEL_BUILD_PLAN_FIELDS = {
+    "feature_recipe_ref",
+    "trainer_recipe_ref",
+    "training_slice",
+    "seed",
+}
+_FEATURE_BUILD_TASK_FIELDS = {"experiment_ref", "model_build_plan_ref"}
+_MODEL_TRAINING_TASK_FIELDS = {
+    "experiment_ref",
+    "model_build_plan_ref",
+    "feature_build_task_ref",
+}
+_FEATURE_MANIFEST_FIELDS = {
+    "model_build_plan_ref",
+    "dataset_revision",
+    "interval_start",
+    "interval_end",
+    "feature_schema_hash",
+    "training_data_hash",
+    "row_count",
+}
+_MODEL_EVIDENCE_FIELDS = {
+    "model_build_plan_ref",
+    "feature_dataset_manifest_ref",
+    "model_artifact",
+}
+_MODEL_ARTIFACT_FIELDS = {
+    "type",
+    "schema_version",
+    "model_key",
+    "model_hash",
+    "training_data_hash",
+    "training_start",
+    "training_end",
+    "training_code_hash",
+    "feature_schema_hash",
+    "available_at",
+    "revision_id",
+    "supersedes_revision_id",
+    "artifact_ref_hash",
+}
+_MODEL_BINDING_FIELDS = {
+    "type",
+    "schema_version",
+    "strategy_id",
+    "input_name",
+    "model_key",
+    "timeline_hash",
+    "artifact_ref_hash",
+}
 
 
 class ValidationCoreFailure(RuntimeError):
@@ -362,6 +425,34 @@ class ResolvedArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelBuildGraph:
+    feature_recipe: ResolvedArtifact
+    trainer_recipe: ResolvedArtifact
+    model_build_plan: ResolvedArtifact
+    feature_build_task: ResolvedArtifact
+    model_training_task: ResolvedArtifact
+    feature_dataset_manifest: ResolvedArtifact
+    model_build_evidence: ResolvedArtifact
+    feature_build_outcome: ResolvedArtifact
+    model_training_outcome: ResolvedArtifact
+
+    def __post_init__(self) -> None:
+        for name in (
+            "feature_recipe",
+            "trainer_recipe",
+            "model_build_plan",
+            "feature_build_task",
+            "model_training_task",
+            "feature_dataset_manifest",
+            "model_build_evidence",
+            "feature_build_outcome",
+            "model_training_outcome",
+        ):
+            if type(getattr(self, name)) is not ResolvedArtifact:
+                raise ValueError(f"{name} must be a ResolvedArtifact")
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateGraph:
     candidate: ResolvedArtifact
     candidate_family: ResolvedArtifact
@@ -376,6 +467,7 @@ class CandidateGraph:
     selected_completed: dict[str, Any] | None
     selected_analysis: dict[str, Any] | None
     required_sample_records: tuple[SampleConsumptionRecord, ...]
+    model_build: ModelBuildGraph | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -399,6 +491,8 @@ class CandidateGraph:
             object.__setattr__(self, name, deepcopy(value))
         if type(self.required_sample_records) is not tuple:
             raise ValueError("required_sample_records must be a tuple")
+        if self.model_build is not None and type(self.model_build) is not ModelBuildGraph:
+            raise ValueError("model_build must be a ModelBuildGraph or None")
         object.__setattr__(
             self,
             "required_sample_records",
@@ -906,11 +1000,196 @@ def _payload(node: object, fields: set[str]) -> tuple[str, dict[str, Any] | None
     return "ok", node.payload
 
 
+def _utc_epoch_nanoseconds(value: object) -> int | None:
+    if type(value) is not str or _UTC.fullmatch(value) is None:
+        return None
+    try:
+        instant = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError:
+        return None
+    epoch = datetime(1970, 1, 1)
+    delta = instant - epoch
+    return ((delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds) * 1_000
+
+
+def _model_build_graph_valid(
+    graph: ModelBuildGraph,
+    *,
+    candidate: dict[str, Any],
+    experiment_ref: object,
+    manifest: dict[str, Any],
+    trial: dict[str, Any],
+    trial_spec: dict[str, Any],
+    completed: dict[str, Any],
+    required: tuple[SampleConsumptionRecord, ...],
+) -> bool:
+    nodes = (
+        (graph.feature_recipe, _FEATURE_RECIPE_FIELDS),
+        (graph.trainer_recipe, _TRAINER_RECIPE_FIELDS),
+        (graph.model_build_plan, _MODEL_BUILD_PLAN_FIELDS),
+        (graph.feature_build_task, _FEATURE_BUILD_TASK_FIELDS),
+        (graph.model_training_task, _MODEL_TRAINING_TASK_FIELDS),
+        (graph.feature_dataset_manifest, _FEATURE_MANIFEST_FIELDS),
+        (graph.model_build_evidence, _MODEL_EVIDENCE_FIELDS),
+        (graph.feature_build_outcome, _TASK_OUTCOME_FIELDS),
+        (graph.model_training_outcome, _TASK_OUTCOME_FIELDS),
+    )
+    payloads: list[dict[str, Any]] = []
+    for node, fields in nodes:
+        status, payload = _payload(node, fields)
+        if status != "ok" or payload is None:
+            return False
+        payloads.append(payload)
+    (
+        feature_recipe,
+        trainer_recipe,
+        plan,
+        feature_task,
+        training_task,
+        feature_manifest,
+        model_evidence,
+        feature_outcome,
+        training_outcome,
+    ) = payloads
+    training_slice = plan["training_slice"]
+    model_artifact = model_evidence["model_artifact"]
+    model_binding = completed.get("model_binding")
+    if (
+        type(training_slice) is not dict
+        or set(training_slice) != {
+            "market_bundle_ref",
+            "dataset_revision",
+            "interval_start",
+            "interval_end",
+        }
+        or type(model_artifact) is not dict
+        or set(model_artifact) != _MODEL_ARTIFACT_FIELDS
+        or type(model_binding) is not dict
+        or set(model_binding) != _MODEL_BINDING_FIELDS
+    ):
+        return False
+    body = {
+        key: value
+        for key, value in model_artifact.items()
+        if key != "artifact_ref_hash"
+    }
+    artifact_hash = "sha256:" + hashlib.sha256(
+        json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+    training_start = model_artifact.get("training_start")
+    training_end = model_artifact.get("training_end")
+    if (
+        type(training_start) is not dict
+        or set(training_start) != {"type", "epoch_nanoseconds"}
+        or training_start.get("type") != "utc_instant"
+        or type(training_start.get("epoch_nanoseconds")) is not int
+        or type(training_end) is not dict
+        or set(training_end) != {"type", "epoch_nanoseconds"}
+        or training_end.get("type") != "utc_instant"
+        or type(training_end.get("epoch_nanoseconds")) is not int
+    ):
+        return False
+    feature_witness = feature_outcome.get("witness")
+    training_witness = training_outcome.get("witness")
+    feature_task_ref = graph.feature_build_task.ref
+    training_task_ref = graph.model_training_task.ref
+    links_valid = (
+        candidate.get("model_build_evidence_ref") == graph.model_build_evidence.ref
+        and plan["feature_recipe_ref"] == graph.feature_recipe.ref
+        and plan["trainer_recipe_ref"] == graph.trainer_recipe.ref
+        and feature_task["experiment_ref"] == experiment_ref
+        and feature_task["model_build_plan_ref"] == graph.model_build_plan.ref
+        and training_task["experiment_ref"] == experiment_ref
+        and training_task["model_build_plan_ref"] == graph.model_build_plan.ref
+        and training_task["feature_build_task_ref"] == feature_task_ref
+        and feature_manifest["model_build_plan_ref"] == graph.model_build_plan.ref
+        and feature_manifest["dataset_revision"] == training_slice["dataset_revision"]
+        and feature_manifest["interval_start"] == training_slice["interval_start"]
+        and feature_manifest["interval_end"] == training_slice["interval_end"]
+        and feature_manifest["feature_schema_hash"]
+        == feature_recipe["feature_schema_hash"]
+        and model_evidence["model_build_plan_ref"] == graph.model_build_plan.ref
+        and model_evidence["feature_dataset_manifest_ref"]
+        == graph.feature_dataset_manifest.ref
+        and model_artifact["artifact_ref_hash"] == artifact_hash
+        and model_artifact["model_key"] == trainer_recipe["model_key"]
+        and model_artifact["training_data_hash"]
+        == feature_manifest["training_data_hash"]
+        and model_artifact["training_code_hash"]
+        == trainer_recipe["training_code_hash"]
+        and model_artifact["feature_schema_hash"]
+        == feature_recipe["feature_schema_hash"]
+        and model_artifact["supersedes_revision_id"] is None
+        and training_start["epoch_nanoseconds"]
+        == _utc_epoch_nanoseconds(training_slice["interval_start"])
+        and training_end["epoch_nanoseconds"]
+        == _utc_epoch_nanoseconds(training_slice["interval_end"])
+        and trial["model_input_bindings"]
+        == {"primary_model": graph.model_build_plan.ref}
+        and trial_spec["resolved_model_refs"] == [model_artifact]
+        and model_binding["type"] == "model_request_binding"
+        and model_binding["schema_version"] == 1
+        and model_binding["input_name"] == "primary_model"
+        and model_binding["model_key"] == model_artifact["model_key"]
+        and model_binding["artifact_ref_hash"] == model_artifact["artifact_ref_hash"]
+        and type(model_binding["timeline_hash"]) is str
+        and _HASH.fullmatch(model_binding["timeline_hash"]) is not None
+        and feature_outcome.get("state") == "COMPLETED"
+        and feature_outcome.get("task_ref")
+        == {"kind": "FEATURE_BUILD", "task_artifact_ref": feature_task_ref}
+        and feature_witness
+        == {
+            "feature_dataset_manifest": {
+                "feature_dataset_manifest_ref": graph.feature_dataset_manifest.ref
+            }
+        }
+        and training_outcome.get("state") == "COMPLETED"
+        and training_outcome.get("task_ref")
+        == {"kind": "MODEL_TRAINING", "task_artifact_ref": training_task_ref}
+        and training_witness
+        == {
+            "model_build_evidence": {
+                "model_build_evidence_ref": graph.model_build_evidence.ref
+            }
+        }
+        and tuple(manifest["task_outcome_refs"]).count(
+            graph.feature_build_outcome.ref
+        )
+        == 1
+        and tuple(manifest["task_outcome_refs"]).count(
+            graph.model_training_outcome.ref
+        )
+        == 1
+    )
+    if not links_valid:
+        return False
+    feature_record = any(
+        record.dataset_revision == training_slice["dataset_revision"]
+        and record.interval_start == training_slice["interval_start"]
+        and record.interval_end == training_slice["interval_end"]
+        and record.purpose == "feature_build"
+        for record in required
+    )
+    training_record = any(
+        record.dataset_revision == training_slice["dataset_revision"]
+        and record.interval_start == training_slice["interval_start"]
+        and record.interval_end == training_slice["interval_end"]
+        and record.purpose == "model_training"
+        for record in required
+    )
+    return feature_record and training_record
+
+
 def _candidate_graph_status(plan: ValidationPlan, graph: object) -> str:
     if type(graph) is not CandidateGraph:
         return "invalid"
+    candidate_fields = (
+        _CANDIDATE_FIELDS
+        if graph.model_build is None
+        else _CANDIDATE_FIELDS | {"model_build_evidence_ref"}
+    )
     nodes = (
-        (graph.candidate, _CANDIDATE_FIELDS),
+        (graph.candidate, candidate_fields),
         (graph.candidate_family, _FAMILY_FIELDS),
         (graph.execution_manifest, _MANIFEST_FIELDS),
         (graph.selection_declaration, _SELECTION_DECLARATION_FIELDS),
@@ -945,9 +1224,14 @@ def _candidate_graph_status(plan: ValidationPlan, graph: object) -> str:
         return "missing"
     completed = graph.selected_completed
     analysis = graph.selected_analysis
-    if not _completed_record_valid(completed) or set(analysis) != (
-        _ANALYSIS_BASE_FIELDS | {"simple_period_return"}
-    ):
+    completed_fields = (
+        _COMPLETED_FIELDS
+        if graph.model_build is None
+        else _COMPLETED_FIELDS | {"model_binding"}
+    )
+    if set(completed) != completed_fields or not _completed_record_valid(
+        completed
+    ) or set(analysis) != (_ANALYSIS_BASE_FIELDS | {"simple_period_return"}):
         return "invalid"
 
     experiment_ref = family["experiment_ref"]
@@ -1023,6 +1307,17 @@ def _candidate_graph_status(plan: ValidationPlan, graph: object) -> str:
         return "invalid"
 
     required = graph.required_sample_records
+    if graph.model_build is not None and not _model_build_graph_valid(
+        graph.model_build,
+        candidate=candidate,
+        experiment_ref=experiment_ref,
+        manifest=manifest,
+        trial=trial,
+        trial_spec=trial_spec,
+        completed=completed,
+        required=required,
+    ):
+        return "invalid"
     discovery = any(
         record.dataset_revision == data_slice["dataset_revision"]
         and record.interval_start == data_slice["interval_start"]
@@ -1037,7 +1332,13 @@ def _candidate_graph_status(plan: ValidationPlan, graph: object) -> str:
         and record.purpose == "selection"
         for record in required
     )
-    return "ok" if discovery and selection_record else "invalid"
+    model_presence_valid = (
+        "model_build_evidence_ref" not in candidate
+        and "model_binding" not in completed
+        if graph.model_build is None
+        else True
+    )
+    return "ok" if discovery and selection_record and model_presence_valid else "invalid"
 
 
 def _completed_trial_outcome_valid(
@@ -1133,7 +1434,10 @@ def _checkpoint_valid(checkpoint: object, snapshot: SampleConsumptionSnapshot) -
 def _completed_record_valid(record: object) -> bool:
     return (
         type(record) is dict
-        and set(record) == _COMPLETED_FIELDS
+        and frozenset(record) in {
+            frozenset(_COMPLETED_FIELDS),
+            frozenset(_COMPLETED_FIELDS | {"model_binding"}),
+        }
         and type(record["semantic_run_id"]) is str
         and bool(record["semantic_run_id"])
         and type(record["execution_result_hash"]) is str
