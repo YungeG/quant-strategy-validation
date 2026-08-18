@@ -1,9 +1,9 @@
 # Strategy Validation 模块设计
 
 - **实现状态：** 以 [Roadmap status registry](../implementation/roadmap.md#2-status-registry) 为唯一权威；本文不维护节点状态
-- **版本：** 0.3
-- **集成权威：** [Integration v1 §5、§7、§9](../overall/integration-v1.md#5-validation-integration-sv-thin-01)
-- **实现计划：** [Strategy Validation](../implementation/plans/validation.md)
+- **版本：** 0.4
+- **集成权威：** [Integration v1 §5、§7、§9](../overall/integration-v1.md#5-validation-integration-sv-thin-01)；[Integration v2](../overall/integration-v2.md)
+- **实现计划：** [Strategy Validation v1](../implementation/plans/validation.md)；[v2 fan-in](../implementation/plans/v2-fan-in.md)
 - **上游：** StrategyCandidate、CandidateFamily、Backtest public evidence
 - **下游：** Promotion Gate
 
@@ -48,8 +48,8 @@ The Plan carries the candidate once. Cases and Reports resolve candidate/family 
 
 Validation receives `BacktestFacade` and `CanonicalEvidenceRepository` directly from the Backtest public root. Backtest alone verifies canonical bytes, manifests, retention, and hash chains; Validation only checks its own semantic/link eligibility. Consumers branch before analysis; only `CompletedPublication.publication_ref` reaches `derive()`.
 
-## 4. Acceptance and deferral
+## 4. Integration v2 model-build provenance
 
-`SV-THIN-01` acceptance requires a precommitted authoritative checkpoint and Plan, required reservation coverage, exact terminal/contamination mappings, an adverse OOS fixture with `simple_period_return = -0.1` and `trade_count = 1` yielding `ValidationReport(result="rejected")`, and forged/cross-case cache-link rejection.
+V2 adds no Validation method or model-quality score. Validation resolves the Candidate's ModelBuildEvidence, Plan/recipes, FeatureDatasetManifest, completed build outcomes, exact Trial/Backtest model binding, and both `feature_build` / `model_training` reservations before running the unchanged evidence-integrity and OOS cases.
 
-Additional validation methods, Feature/model/trainer ABI, ModelBuild, and non-null model plans are outside v1.
+Callable/plugin/framework ABI, feature/model bytes, model execution, tuning, multiple model plans, and additional validation methods remain excluded.
