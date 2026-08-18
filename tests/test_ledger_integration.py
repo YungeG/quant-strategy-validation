@@ -82,6 +82,8 @@ def _failure(code: str, call: Callable[[], object]) -> None:
 @pytest.mark.parametrize(
     ("artifact_type", "purpose", "marker"),
     (
+        ("feature_build_task", "feature_build", "d"),
+        ("model_training_task", "model_training", "e"),
         ("trial_declaration", "discovery", "a"),
         ("selection_declaration", "selection", "b"),
         ("validation_case", "validation", "c"),
