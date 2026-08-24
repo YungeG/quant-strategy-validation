@@ -29,7 +29,8 @@ from crypto_quant_validation import (
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from tests.support.backtest_consumer_port import (
+from tests.support.backtest_consumer_port import (  # noqa: E402
+    CONTRACT_V2_PATH,
     InMemoryBacktestConsumerPort,
 )
 
@@ -81,9 +82,13 @@ def _record(producer_ref: ArtifactRef, purpose: str) -> SampleConsumptionRecord:
     )
 
 
-def _policy(metric_profile_ref: object) -> ValidationPolicy:
+def _policy(
+    metric_profile_ref: object,
+    *,
+    grade: str = "development",
+) -> ValidationPolicy:
     return ValidationPolicy(
-        accepted_backtest_grades=("development",),
+        accepted_backtest_grades=(grade,),
         accepted_metric_profile_refs=(metric_profile_ref,),
         holdout=Holdout(
             "market-bundle:oos",
@@ -126,6 +131,32 @@ class RecordingPort(InMemoryBacktestConsumerPort):
         return super().derive(completed_ref, metric_profile_ref)
 
 
+class DecisionGradePort(RecordingPort):
+    def __init__(self, foundation: LocalFoundation) -> None:
+        InMemoryBacktestConsumerPort.__init__(self, contract_path=CONTRACT_V2_PATH)
+        self._foundation = foundation
+        self.run_requests = []
+        self.run_sample_counts = []
+        self.run_artifact_types = []
+        self.derive_calls = 0
+        self.completed_v3_calls: list[object] = []
+        self.analysis_v2_calls: list[object] = []
+
+    def load_completed(self, ref: dict) -> dict:
+        raise AssertionError("V2 completion must not use load_completed")
+
+    def load_analysis(self, ref: dict) -> dict:
+        raise AssertionError("V2 analysis must not use load_analysis")
+
+    def load_completed_v3(self, ref: dict) -> dict:
+        self.completed_v3_calls.append(deepcopy(ref))
+        return super().load_completed_v3(ref)
+
+    def load_analysis_v2(self, ref: dict) -> dict:
+        self.analysis_v2_calls.append(deepcopy(ref))
+        return super().load_analysis_v2(ref)
+
+
 class OosAnalysisPort(RecordingPort):
     def __init__(
         self, foundation: LocalFoundation, mutate: Callable[[dict], None]
@@ -146,11 +177,18 @@ def _candidate(
     foundation: LocalFoundation,
     ledger: SampleConsumptionLedger,
     port: InMemoryBacktestConsumerPort,
+    *,
+    case_id: str = "adverse_completed",
+    grade: str = "development",
 ) -> ArtifactRef:
-    fixture = port.case("adverse_completed")
+    fixture = port.case(case_id)
     profile_ref = fixture["derive"]["metric_profile_ref"]
-    publication_ref = fixture["completed"]["publication_ref"]
-    analysis_ref = fixture["analysis"]["analysis_ref"]
+    completed = fixture.get("completed_v3", fixture.get("completed"))
+    analysis = fixture.get("analysis_v2", fixture.get("analysis"))
+    if type(completed) is not dict or type(analysis) is not dict:
+        raise ValueError("fixture must contain one completed and analysis view")
+    publication_ref = completed["publication_ref"]
+    analysis_ref = analysis["analysis_ref"]
 
     experiment_ref = _publish(
         foundation, RESEARCH_ARTIFACT_LOG, "experiment_spec", {"fixture": "one"}
@@ -191,7 +229,7 @@ def _candidate(
         {
             "metric_profile_ref": profile_ref,
             "eligible_trial_statuses": ["COMPLETED"],
-            "accepted_backtest_grades": ["development"],
+            "accepted_backtest_grades": [grade],
             "hard_filters": [],
             "ordering": ["simple_period_return:descending"],
             "max_selections": 1,
@@ -374,6 +412,118 @@ def test_adverse_fixture_publishes_rejected_report_after_snapshot_plan_and_reser
         "validation_report",
     ]
     assert _oos_result_payload(foundation)["outcome"] == "FAIL"
+
+
+def test_decision_grade_fixture_publishes_supported_report_and_replays(
+    tmp_path: Path,
+) -> None:
+    foundation = LocalFoundation(tmp_path, clock=lambda: ACCEPTED_AT)
+    ledger = SampleConsumptionLedger(foundation)
+    port = DecisionGradePort(foundation)
+    candidate_ref = _candidate(
+        foundation,
+        ledger,
+        port,
+        case_id="decision_grade_completed_v3",
+        grade="decision_grade",
+    )
+    profile = port.case("decision_grade_completed_v3")["derive"][
+        "metric_profile_ref"
+    ]
+    policy = _policy(profile, grade="decision_grade")
+
+    result = validate_candidate(
+        candidate_ref,
+        policy,
+        {"fixture_case": "decision_grade_completed_v3"},
+        RESERVED_AT,
+        foundation,
+        ledger,
+        port,
+    )
+
+    assert type(result) is PublishedValidationReport
+    report = _payload(foundation, result.validation_report_ref)
+    plan = _payload(foundation, result.validation_plan_ref)
+    assert report["result"] == "supported"
+    assert plan["accepted_backtest_grades"] == ["decision_grade"]
+    assert port.completed_v3_calls
+    assert port.analysis_v2_calls
+    assert port.derive_calls == 1
+    oos = _oos_result_payload(foundation)
+    assert oos["outcome"] == "PASS"
+    evidence = oos["evidence"]
+    assert set(evidence) == {
+        "publication_ref",
+        "analysis_ref",
+        "metric_profile_ref",
+        "source_execution_result_hash",
+        "result_grade",
+        "metric_key",
+        "metric_value",
+        "trade_count",
+    }
+    assert evidence["result_grade"] == "decision_grade"
+    assert "rebuild_verification_ref" not in evidence
+    assert "proof_publication_manifest_ref" not in evidence
+
+    before = (
+        port.derive_calls,
+        len(port.run_requests),
+        len(foundation.entries(ARTIFACT_LOG)),
+        len(foundation.entries(SAMPLE_LOG)),
+    )
+    replay = validate_candidate(
+        candidate_ref,
+        policy,
+        {"fixture_case": "decision_grade_completed_v3"},
+        RESERVED_AT,
+        foundation,
+        ledger,
+        port,
+    )
+    assert replay == result
+    assert before == (
+        port.derive_calls,
+        len(port.run_requests),
+        len(foundation.entries(ARTIFACT_LOG)),
+        len(foundation.entries(SAMPLE_LOG)),
+    )
+
+
+def test_decision_grade_v2_failure_produces_no_report_or_v1_fallback(
+    tmp_path: Path,
+) -> None:
+    foundation = LocalFoundation(tmp_path, clock=lambda: ACCEPTED_AT)
+    ledger = SampleConsumptionLedger(foundation)
+    port = DecisionGradePort(foundation)
+    candidate_ref = _candidate(
+        foundation,
+        ledger,
+        port,
+        case_id="decision_grade_completed_v3",
+        grade="decision_grade",
+    )
+    case = port.case("decision_grade_completed_v3")
+    port.inject_failures(
+        case["completed_v3"]["publication_ref"],
+        "PORT_STATIC_PROOF_MISMATCH",
+    )
+    policy = _policy(case["derive"]["metric_profile_ref"], grade="decision_grade")
+
+    result = validate_candidate(
+        candidate_ref,
+        policy,
+        {"fixture_case": "decision_grade_completed_v3"},
+        RESERVED_AT,
+        foundation,
+        ledger,
+        port,
+    )
+
+    assert result == NoReport(None, "PORT_STATIC_PROOF_MISMATCH")
+    assert foundation.entries(ARTIFACT_LOG) == ()
+    assert port.run_requests == []
 
 
 @pytest.mark.parametrize(

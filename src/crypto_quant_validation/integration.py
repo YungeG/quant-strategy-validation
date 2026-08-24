@@ -37,6 +37,22 @@ _REPORT_RESULTS = frozenset({"supported", "rejected", "inconclusive"})
 _HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _DECIMAL = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?\Z")
 _UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z\Z")
+_BACKTEST_REF_VARIANTS = {
+    "completed": {
+        "backtest_canonical_publication_ref": (
+            "canonical_publication_manifest",
+            1,
+        ),
+        "backtest_canonical_publication_ref_v2": (
+            "canonical_publication_manifest",
+            2,
+        ),
+    },
+    "analysis": {
+        "analysis_artifact_ref": ("backtest_analysis", 1),
+        "analysis_artifact_ref_v2": ("backtest_analysis", 2),
+    },
+}
 
 _CANDIDATE_FIELDS = {
     "candidate_family_ref",
@@ -90,6 +106,10 @@ _COMPLETED_FIELDS = {
     "semantic_run_id",
     "execution_result_hash",
     "result_grade",
+}
+_COMPLETED_V3_FIELDS = _COMPLETED_FIELDS | {
+    "rebuild_verification_ref",
+    "proof_publication_manifest_ref",
 }
 _ANALYSIS_BASE_FIELDS = {
     "analysis_ref",
@@ -210,6 +230,42 @@ def _require_ref(value: object, name: str) -> object:
         raise ValueError(f"{name} must be an opaque reference wire value")
     _wire_key(value)
     return value
+
+
+def _backtest_ref_version(value: object, kind: str) -> int:
+    try:
+        variants = _BACKTEST_REF_VARIANTS[kind]
+    except KeyError as error:
+        raise ValueError("Backtest reference kind is not recognized") from error
+    if type(value) is not dict or set(value) != {"type", "artifact_ref"}:
+        raise ValueError(f"{kind}_ref must use one exact nominal Backtest reference")
+    artifact = value.get("artifact_ref")
+    if (
+        type(artifact) is not dict
+        or set(artifact)
+        != {"type", "artifact_type", "schema_version", "content_hash"}
+        or artifact.get("type") != "artifact_ref"
+        or type(artifact.get("content_hash")) is not str
+        or _HASH.fullmatch(artifact["content_hash"]) is None
+    ):
+        raise ValueError(f"{kind}_ref artifact_ref is not canonical")
+    expected = variants.get(value.get("type"))
+    actual = (artifact.get("artifact_type"), artifact.get("schema_version"))
+    if expected != actual:
+        raise ValueError(f"{kind}_ref nominal type and schema_version do not match")
+    return expected[1]
+
+
+def _artifact_ref_matches(value: object, artifact_type: str, schema_version: int) -> bool:
+    return (
+        type(value) is dict
+        and set(value) == {"type", "artifact_type", "schema_version", "content_hash"}
+        and value.get("type") == "artifact_ref"
+        and value.get("artifact_type") == artifact_type
+        and value.get("schema_version") == schema_version
+        and type(value.get("content_hash")) is str
+        and _HASH.fullmatch(value["content_hash"]) is not None
+    )
 
 
 def _require_ref_tuple(value: object, name: str) -> tuple[object, ...]:
@@ -345,8 +401,10 @@ class ValidationPolicy:
         grades = _require_string_tuple(
             self.accepted_backtest_grades, "accepted_backtest_grades"
         )
-        if grades != ("development",):
-            raise ValueError("v1 accepts only the development Backtest grade")
+        if grades not in {("development",), ("decision_grade",)}:
+            raise ValueError(
+                "accepted_backtest_grades must select one exact supported grade"
+            )
         refs = _require_ref_tuple(
             self.accepted_metric_profile_refs, "accepted_metric_profile_refs"
         )
@@ -1243,7 +1301,9 @@ def _candidate_graph_status(plan: ValidationPlan, graph: object) -> str:
     completed = graph.selected_completed
     analysis = graph.selected_analysis
     completed_fields = (
-        _COMPLETED_FIELDS
+        _COMPLETED_V3_FIELDS
+        if "rebuild_verification_ref" in completed
+        else _COMPLETED_FIELDS
         if graph.model_build is None
         else _COMPLETED_FIELDS | {"model_binding"}
     )
@@ -1450,19 +1510,45 @@ def _checkpoint_valid(checkpoint: object, snapshot: SampleConsumptionSnapshot) -
 
 
 def _completed_record_valid(record: object) -> bool:
-    return (
-        type(record) is dict
-        and frozenset(record) in {
-            frozenset(_COMPLETED_FIELDS),
-            frozenset(_COMPLETED_FIELDS | {"model_binding"}),
-        }
-        and type(record["semantic_run_id"]) is str
+    if type(record) is not dict:
+        return False
+    fields = frozenset(record)
+    if fields not in {
+        frozenset(_COMPLETED_FIELDS),
+        frozenset(_COMPLETED_FIELDS | {"model_binding"}),
+        frozenset(_COMPLETED_V3_FIELDS),
+    }:
+        return False
+    try:
+        version = _backtest_ref_version(record["publication_ref"], "completed")
+    except (KeyError, ValueError):
+        return False
+    common = (
+        type(record["semantic_run_id"]) is str
         and bool(record["semantic_run_id"])
         and type(record["execution_result_hash"]) is str
         and _HASH.fullmatch(record["execution_result_hash"]) is not None
         and type(record["result_grade"]) is str
         and bool(record["result_grade"])
     )
+    if not common:
+        return False
+    if fields == frozenset(_COMPLETED_V3_FIELDS):
+        return (
+            version == 2
+            and record["result_grade"] == "decision_grade"
+            and _artifact_ref_matches(
+                record["rebuild_verification_ref"],
+                "deterministic_rebuild_verification",
+                1,
+            )
+            and _artifact_ref_matches(
+                record["proof_publication_manifest_ref"],
+                "deterministic_rebuild_verification_publication_manifest",
+                1,
+            )
+        )
+    return version == 1
 
 
 def _terminal_record_valid(record: dict[str, Any]) -> bool:
@@ -1495,8 +1581,16 @@ def _analysis_links_valid(
 ) -> bool:
     try:
         trade_count = analysis.get("trade_count")
+        completed_version = _backtest_ref_version(
+            completed["publication_ref"], "completed"
+        )
+        analysis_version = _backtest_ref_version(analysis["analysis_ref"], "analysis")
+        source_version = _backtest_ref_version(
+            analysis["source_publication_ref"], "completed"
+        )
         return (
-            analysis.get("metric_profile_ref") == plan.oos_rule.metric_profile_ref
+            completed_version == analysis_version == source_version
+            and analysis.get("metric_profile_ref") == plan.oos_rule.metric_profile_ref
             and _wire_key(analysis.get("metric_profile_ref"))
             in {_wire_key(ref) for ref in plan.accepted_metric_profile_refs}
             and analysis.get("source_publication_ref") == completed["publication_ref"]

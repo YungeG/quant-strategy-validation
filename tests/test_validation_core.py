@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import ast
+import sys
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
-import sys
 
 import pytest
 
@@ -33,6 +33,7 @@ from crypto_quant_validation import (  # noqa: E402
     build_snapshot,
     build_validation_plan,
 )
+
 from tests.support.backtest_consumer_port import (  # noqa: E402
     InMemoryBacktestConsumerPort,
     PortFailure,
@@ -319,15 +320,26 @@ def test_plan_is_pre_result_candidate_specific_and_preserves_six_field_record() 
     for forbidden in ("result", "analysis_ref", "simple_period_return", "trade_count"):
         assert not hasattr(plan, forbidden)
 
-    forged = object.__new__(ValidationPolicy)
-    object.__setattr__(forged, "accepted_backtest_grades", ("decision_grade",))
-    object.__setattr__(forged, "accepted_metric_profile_refs", (metric_profile_ref,))
-    object.__setattr__(forged, "holdout", plan.holdout)
-    object.__setattr__(forged, "oos_rule", plan.oos_rule)
-    object.__setattr__(forged, "decision_rule", plan.decision_rule)
-    with pytest.raises(ValidationCoreFailure) as caught:
-        build_validation_plan("candidate:selected", "snapshot:pre-oos", forged)
-    assert caught.value.code == "VALIDATION_PLAN_INVALID"
+    decision_policy = ValidationPolicy(
+        ("decision_grade",),
+        (metric_profile_ref,),
+        plan.holdout,
+        plan.oos_rule,
+        plan.decision_rule,
+    )
+    decision_plan = build_validation_plan(
+        "candidate:decision-grade", "snapshot:pre-oos", decision_policy
+    )
+    assert decision_plan.accepted_backtest_grades == ("decision_grade",)
+
+    with pytest.raises(ValueError, match="one exact supported grade"):
+        ValidationPolicy(
+            ("decision_grade", "development"),
+            (metric_profile_ref,),
+            plan.holdout,
+            plan.oos_rule,
+            plan.decision_rule,
+        )
 
 
 def test_admission_enforces_accepted_candidate_checkpoint_and_reservations() -> None:

@@ -35,6 +35,7 @@ from .integration import (
     ValidationPlan,
     ValidationPolicy,
     ValidationReport,
+    _backtest_ref_version,
     aggregate_validation_report,
     assess_admission,
     assess_oos,
@@ -520,17 +521,19 @@ def _candidate_graph(
             required_records += model_required
     except FoundationFailure:
         raise
+    except _GraphFailure:
+        raise
     except Exception as error:
         raise _GraphFailure() from error
 
     try:
-        completed = backtest.load_completed(
-            _plain(candidate_payload["selected_publication_ref"])
+        completed = _load_completed(
+            backtest, candidate_payload["selected_publication_ref"]
         )
-        analysis = backtest.load_analysis(
-            _plain(candidate_payload["selected_analysis_ref"])
-        )
+        analysis = _load_analysis(backtest, candidate_payload["selected_analysis_ref"])
     except FoundationFailure:
+        raise
+    except _GraphFailure:
         raise
     except Exception as error:
         raise _GraphFailure(_failure_code(error)) from error
@@ -886,6 +889,45 @@ def _failure_code(error: Exception) -> str:
     return value if type(value) is str and value else "BACKTEST_OPERATION_FAILED"
 
 
+def _load_completed(backtest: object, ref: object) -> dict[str, object]:
+    try:
+        version = _backtest_ref_version(_plain(ref), "completed")
+    except ValueError as error:
+        raise _GraphFailure("PORT_REF_TYPE_MISMATCH") from error
+    operation = "load_completed" if version == 1 else "load_completed_v3"
+    loader = getattr(backtest, operation, None)
+    if not callable(loader):
+        raise _GraphFailure("PORT_REF_TYPE_MISMATCH")
+    record = loader(_plain(ref))
+    if type(record) is not dict:
+        raise _GraphFailure("PORT_MANIFEST_INVALID")
+    return record
+
+
+def _load_analysis(backtest: object, ref: object) -> dict[str, object]:
+    try:
+        version = _backtest_ref_version(_plain(ref), "analysis")
+    except ValueError as error:
+        raise _GraphFailure("PORT_REF_TYPE_MISMATCH") from error
+    operation = "load_analysis" if version == 1 else "load_analysis_v2"
+    loader = getattr(backtest, operation, None)
+    if not callable(loader):
+        raise _GraphFailure("PORT_REF_TYPE_MISMATCH")
+    record = loader(_plain(ref))
+    if type(record) is not dict:
+        raise _GraphFailure("PORT_MANIFEST_INVALID")
+    return record
+
+
+def _is_terminal_ref(value: object) -> bool:
+    plain = _plain(value)
+    return (
+        type(plain) is dict
+        and set(plain) == {"type", "artifact_type", "schema_version", "content_hash"}
+        and plain.get("type") == "artifact_ref"
+    )
+
+
 def _require_backtest(backtest: object) -> None:
     if not all(
         callable(getattr(backtest, name, None))
@@ -916,30 +958,23 @@ def _oos_result(
     except Exception as error:  # noqa: BLE001 - frozen provider boundary
         return assess_oos(plan, ProviderFailure(_failure_code(error)), None)
     try:
-        completed = backtest.load_completed(run_ref)
+        if _is_terminal_ref(run_ref):
+            terminal = backtest.load_terminal(run_ref)
+            return assess_oos(
+                plan, OosObservation(plan, case_wire, case_wire, terminal), None
+            )
+        completed = _load_completed(backtest, run_ref)
     except FoundationFailure:
         raise
     except Exception as error:  # noqa: BLE001 - frozen provider boundary
-        if _failure_code(error) != "PORT_REF_TYPE_MISMATCH":
-            return assess_oos(plan, ProviderFailure(_failure_code(error)), None)
-        try:
-            terminal = backtest.load_terminal(run_ref)
-        except FoundationFailure:
-            raise
-        except Exception as terminal_error:  # noqa: BLE001 - frozen provider boundary
-            return assess_oos(
-                plan, ProviderFailure(_failure_code(terminal_error)), None
-            )
-        return assess_oos(
-            plan, OosObservation(plan, case_wire, case_wire, terminal), None
-        )
+        return assess_oos(plan, ProviderFailure(_failure_code(error)), None)
 
     observation = OosObservation(plan, case_wire, case_wire, completed)
     try:
         analysis_ref = backtest.derive(
             run_ref, _plain(plan.oos_rule.metric_profile_ref)
         )
-        analysis = backtest.load_analysis(analysis_ref)
+        analysis = _load_analysis(backtest, analysis_ref)
     except FoundationFailure:
         raise
     except Exception as error:  # noqa: BLE001 - frozen provider boundary
