@@ -33,6 +33,10 @@ from .sample_consumption import (
     assess_untouched_holdout,
     build_snapshot,
 )
+from .target_runtime import (
+    ValidationTargetMaterializationEvidence,
+    validate_target_candidate,
+)
 
 __all__ = [
     "FAILURE_PRECEDENCE",
@@ -61,6 +65,7 @@ __all__ = [
     "ValidationPlan",
     "ValidationPolicy",
     "ValidationReport",
+    "ValidationTargetMaterializationEvidence",
     "aggregate_validation_report",
     "assess_admission",
     "assess_oos",
@@ -68,4 +73,5 @@ __all__ = [
     "build_snapshot",
     "build_validation_plan",
     "validate_candidate",
+    "validate_target_candidate",
 ]
