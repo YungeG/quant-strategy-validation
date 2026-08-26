@@ -276,6 +276,7 @@ def _candidate_graph(
     foundation: LocalFoundation,
     backtest: object,
     reservation_at: str,
+    candidate_schema_versions: tuple[int, ...] = (1, 2),
 ) -> tuple[
     CandidateGraph,
     tuple[tuple[SampleConsumptionRecord, ArtifactRef, LogEntryRef], ...],
@@ -286,7 +287,7 @@ def _candidate_graph(
             candidate_ref,
             "strategy_candidate",
             _RESEARCH_ARTIFACT_LOG,
-            (1, 2),
+            candidate_schema_versions,
         )
         family_ref = _ref_from_wire(candidate_payload["candidate_family_ref"])
         selection_ref = _ref_from_wire(candidate_payload["selection_declaration_ref"])

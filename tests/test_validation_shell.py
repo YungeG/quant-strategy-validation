@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import sys
 from collections.abc import Callable
@@ -412,6 +413,50 @@ def test_adverse_fixture_publishes_rejected_report_after_snapshot_plan_and_reser
         "validation_report",
     ]
     assert _oos_result_payload(foundation)["outcome"] == "FAIL"
+
+
+def test_legacy_validation_v1_canonical_bytes_are_frozen(tmp_path: Path) -> None:
+    foundation, ledger, port, candidate_ref, policy = _setup(tmp_path)
+
+    result = validate_candidate(
+        candidate_ref,
+        policy,
+        {"fixture_case": "adverse_completed"},
+        RESERVED_AT,
+        foundation,
+        ledger,
+        port,
+    )
+
+    assert type(result) is PublishedValidationReport
+    assert result.validation_plan_ref.content_hash == (
+        "sha256:3e96ed28dd5f9ceb93daa5fe7fab19d47db483c6c75524b210810369593b7ca7"
+    )
+    assert result.validation_report_ref.content_hash == (
+        "sha256:d3ef01c6682d7a9250200cc6bee6ee91c5c1977ad98727f7051db3ba8976d35b"
+    )
+    assert [
+        (
+            json.loads(entry.payload)["artifact_type"],
+            json.loads(entry.payload)["schema_version"],
+            hashlib.sha256(entry.payload).hexdigest(),
+        )
+        for entry in foundation.entries(ARTIFACT_LOG)
+    ] == [
+        ("sample_consumption_ledger_snapshot", 1, "64f3dfd53999f3592b69476b5f296346fa9f1d60207585d3f9957d31526c8f2f"),
+        ("validation_plan", 1, "ece0ee44375f3b1988fccbcdc3bddd955d7c74bb743f67ce4907e0c058f84857"),
+        ("sample_integrity_assessment", 1, "9a9c821df1d5243872c62029bce640f56ab522e06cba65b27d88696b1c8dc7fd"),
+        ("validation_case", 1, "d9e61b3748cb5d1559672eea3a84b3853893e14e18a9fb65ec24ae7a80301810"),
+        ("validation_case_result", 1, "ed473e729f22fc9c10ec26e037d1c094411e0f6c823fd146bb7d00bdbba9d781"),
+        ("validation_case", 1, "03e1bfff89dc6f1fc39e7c0753d8bedf0cb8820058364b3254b94aaa80d5ba99"),
+        ("validation_case_result", 1, "83bbe3ff8979864d5203ed6c0b5b7c809e45ec2f52aea18d35367baa10cec5b7"),
+        ("validation_report", 1, "c3d0e63b75a9d2ebe94e67937b26a1b41f3543fb08674fccc492357d5bc49c20"),
+    ]
+    assert [hashlib.sha256(entry.payload).hexdigest() for entry in foundation.entries(SAMPLE_LOG)] == [
+        "45080578b47d4fad2996ad567bb6d688171b1349bfe379e4efeb6135e5673b53",
+        "eab001401ce0a7987e09fb7a16a0531b674c20dea553edb458be6a8b82fa274b",
+        "b0752cf826202734c06c594eb8b14efb9576420fe00e2014a7b95b4576a1a3c7",
+    ]
 
 
 def test_decision_grade_fixture_publishes_supported_report_and_replays(

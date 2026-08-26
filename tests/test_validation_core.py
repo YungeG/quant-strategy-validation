@@ -40,7 +40,8 @@ from tests.support.backtest_consumer_port import (  # noqa: E402
 )
 
 INTEGRATION_PATH = (
-    ROOT / "strategy-validation/src/crypto_quant_validation/integration.py"
+    Path(__file__).resolve().parents[1]
+    / "src/crypto_quant_validation/integration.py"
 )
 DATA_START = "2026-01-01T00:00:00.000000Z"
 DATA_END = "2026-02-01T00:00:00.000000Z"
