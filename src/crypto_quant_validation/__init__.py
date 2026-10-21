@@ -25,6 +25,17 @@ from .integration import (
     build_validation_plan,
 )
 from .ledger import SampleConsumptionLedger
+from .paired_portfolio_comparison_v1 import (
+    PAIRED_PORTFOLIO_COMPARISON_FAILURE_PRECEDENCE,
+    PairedPortfolioComparisonRuleV1,
+    PairedPortfolioComparisonV1,
+    compare_paired_portfolio_development_v1,
+)
+from .retrospective_reservation import (
+    RetrospectiveReservationError,
+    RetrospectiveReservationReceipt,
+    reserve_retrospective_read,
+)
 from .runtime import NoReport, PublishedValidationReport, validate_candidate
 from .sample_consumption import (
     SampleConsumptionRecord,
@@ -33,6 +44,11 @@ from .sample_consumption import (
     assess_untouched_holdout,
     build_snapshot,
 )
+from .statistical_reservation import (
+    StatisticalReservationError,
+    StatisticalReservationReceipt,
+    reserve_statistical_read,
+)
 from .target_runtime import (
     ValidationTargetMaterializationEvidence,
     validate_target_candidate,
@@ -40,6 +56,7 @@ from .target_runtime import (
 
 __all__ = [
     "FAILURE_PRECEDENCE",
+    "PAIRED_PORTFOLIO_COMPARISON_FAILURE_PRECEDENCE",
     "AnalysisObservation",
     "CandidateGraph",
     "CaseResult",
@@ -49,16 +66,22 @@ __all__ = [
     "NoReport",
     "OosObservation",
     "OosRule",
+    "PairedPortfolioComparisonRuleV1",
+    "PairedPortfolioComparisonV1",
     "ProviderFailure",
     "ProviderFailureEvidence",
     "PublishedValidationReport",
     "ResolvedArtifact",
+    "RetrospectiveReservationError",
+    "RetrospectiveReservationReceipt",
     "SampleAdmissionEvidence",
     "SampleCaseEvidence",
     "SampleConsumptionLedger",
     "SampleConsumptionRecord",
     "SampleConsumptionSnapshot",
     "SampleIntegrityResult",
+    "StatisticalReservationError",
+    "StatisticalReservationReceipt",
     "TerminalCaseEvidence",
     "ThresholdEvaluation",
     "ValidationCoreFailure",
@@ -72,6 +95,9 @@ __all__ = [
     "assess_untouched_holdout",
     "build_snapshot",
     "build_validation_plan",
+    "compare_paired_portfolio_development_v1",
+    "reserve_retrospective_read",
+    "reserve_statistical_read",
     "validate_candidate",
     "validate_target_candidate",
 ]

@@ -11,7 +11,12 @@ from crypto_quant_domain import (
     canonical_bytes,
     canonical_sha256,
 )
-from crypto_quant_foundation import FoundationFailure, LocalFoundation, LogCheckpoint
+from crypto_quant_foundation import (
+    FoundationFailure,
+    LocalFoundation,
+    LogCheckpoint,
+    LogEntryRef,
+)
 from crypto_quant_validation import (
     Holdout,
     SampleConsumptionLedger,
@@ -55,7 +60,7 @@ def _record(
     )
 
 
-def _entry_ref_wire(ref: object) -> dict[str, object]:
+def _entry_ref_wire(ref: LogEntryRef) -> dict[str, object]:
     return {
         "log_name": ref.log_name,
         "log_sequence": ref.log_sequence,
@@ -67,7 +72,9 @@ def _artifact_event_id(ref: ArtifactRef) -> str:
     return canonical_sha256(("artifact-publication-v1", ARTIFACT_LOG, ref))
 
 
-def _ledger(tmp_path: Path, *times: str) -> tuple[SampleConsumptionLedger, LocalFoundation]:
+def _ledger(
+    tmp_path: Path, *times: str
+) -> tuple[SampleConsumptionLedger, LocalFoundation]:
     values = iter(times)
     foundation = LocalFoundation(tmp_path, clock=lambda: next(values))
     return SampleConsumptionLedger(foundation), foundation
@@ -198,7 +205,10 @@ def test_snapshot_reconstruction_excludes_a_later_equal_time_reservation(
     assessment = foundation.read(ref=assessment_ref).artifact
     snapshot_entry = foundation.entries(ARTIFACT_LOG)[0]
 
-    assert json.loads(snapshot_entry.payload)["artifact_type"] == "sample_consumption_ledger_snapshot"
+    assert (
+        json.loads(snapshot_entry.payload)["artifact_type"]
+        == "sample_consumption_ledger_snapshot"
+    )
     assert snapshot_entry.event_id == _artifact_event_id(snapshot_ref)
     assert snapshot["checkpoint"]["upper_log_sequence"] == 1
     assert foundation.entries(SAMPLE_LOG)[-1].entry_ref == later_ref
@@ -234,7 +244,9 @@ def test_assessment_publishes_canonical_conflicting_append_entry_refs(
 
     assert assessment["snapshot_ref"] == snapshot_ref.to_canonical_dict()
     assert assessment["untouched"] is False
-    assert assessment["conflicting_append_entry_refs"] == (_entry_ref_wire(conflict_ref),)
+    assert assessment["conflicting_append_entry_refs"] == (
+        _entry_ref_wire(conflict_ref),
+    )
     assert json.loads(entry.payload)["artifact_type"] == "sample_integrity_assessment"
 
 
@@ -263,7 +275,9 @@ def test_corrupt_sample_prefix_does_not_publish_an_assessment(
     with pytest.raises(FoundationFailure) as raised:
         ledger.assess_holdout(snapshot_ref, HOLDOUT)
     assert raised.value.code == "LOG_INTEGRITY"
-    assert (tmp_path / "registries" / f"{ARTIFACT_LOG}.jsonl").read_text().count("\n") == 1
+    assert (tmp_path / "registries" / f"{ARTIFACT_LOG}.jsonl").read_text().count(
+        "\n"
+    ) == 1
 
 
 def test_wrong_log_snapshot_fails_without_an_assessment(tmp_path: Path) -> None:
@@ -281,9 +295,13 @@ def test_wrong_log_snapshot_fails_without_an_assessment(tmp_path: Path) -> None:
         },
     )
     snapshot_ref = foundation.put(envelope=envelope)
-    foundation.append(ARTIFACT_LOG, _artifact_event_id(snapshot_ref), canonical_bytes(envelope))
+    foundation.append(
+        ARTIFACT_LOG, _artifact_event_id(snapshot_ref), canonical_bytes(envelope)
+    )
 
-    _failure("SAMPLE_LEDGER_CONFLICT", lambda: ledger.assess_holdout(snapshot_ref, HOLDOUT))
+    _failure(
+        "SAMPLE_LEDGER_CONFLICT", lambda: ledger.assess_holdout(snapshot_ref, HOLDOUT)
+    )
     assert len(foundation.entries(ARTIFACT_LOG)) == 1
 
 
@@ -315,9 +333,111 @@ def test_forged_issued_checkpoint_cannot_hide_a_holdout_reservation(
         },
     )
     snapshot_ref = foundation.put(envelope=envelope)
-    foundation.append(ARTIFACT_LOG, _artifact_event_id(snapshot_ref), canonical_bytes(envelope))
+    foundation.append(
+        ARTIFACT_LOG, _artifact_event_id(snapshot_ref), canonical_bytes(envelope)
+    )
 
     with pytest.raises(FoundationFailure) as raised:
         ledger.assess_holdout(snapshot_ref, HOLDOUT)
     assert raised.value.code == "LOG_INTEGRITY"
     assert len(foundation.entries(ARTIFACT_LOG)) == 1
+
+
+@pytest.mark.parametrize(
+    ("artifact_type", "purpose", "marker"),
+    (
+        ("statistical_feature_read_task", "feature_build", "6"),
+        ("statistical_training_read_task", "model_training", "7"),
+        ("statistical_outcome_read_task", "validation", "8"),
+    ),
+)
+def test_statistical_producers_preserve_existing_sample_wire_and_identity(
+    tmp_path: Path, artifact_type: str, purpose: str, marker: str
+) -> None:
+    ledger, foundation = _ledger(tmp_path, *([RECEIVED_AT] * 8))
+    producer = _producer(artifact_type, marker)
+    record = _record(producer, purpose)
+    entry_ref = ledger.reserve(record, producer)
+    entry = foundation.entries(SAMPLE_LOG, entry_ref)[-1]
+    expected = ArtifactEnvelope.create(
+        "sample_consumption_append",
+        1,
+        {
+            "record": {
+                "dataset_revision": record.dataset_revision,
+                "interval_start": record.interval_start,
+                "interval_end": record.interval_end,
+                "purpose": record.purpose,
+                "consumer_id": record.consumer_id,
+                "consumed_at": record.consumed_at,
+            },
+            "producer_ref": producer,
+        },
+    )
+    assert entry.payload == canonical_bytes(expected)
+    assert record.consumer_id == canonical_sha256(("sample-consumer-v1", producer))
+    assert entry.event_id == canonical_sha256(
+        (
+            "sample-consumption-append-v1",
+            producer,
+            record.dataset_revision,
+            record.interval_start,
+            record.interval_end,
+            record.purpose,
+        )
+    )
+    assert ledger.reserve(record, producer) == entry_ref
+    with pytest.raises(FoundationFailure) as raised:
+        ledger.reserve(_record(producer, purpose, consumed_at=RECEIVED_AT), producer)
+    assert raised.value.code == "LOG_CONFLICT"
+    assert len(foundation.entries(SAMPLE_LOG, foundation.checkpoint(SAMPLE_LOG))) == 1
+    with pytest.raises(ValueError, match="purpose"):
+        ledger.reserve(_record(producer, "discovery"), producer)
+    assert not any((tmp_path / "artifacts" / "sha256").iterdir())
+
+
+@pytest.mark.parametrize(
+    "kind,purpose,marker",
+    (
+        ("retrospective_input_read_task", "discovery", "1"),
+        ("retrospective_feature_read_task", "feature_build", "2"),
+        ("retrospective_training_read_task", "model_training", "3"),
+        ("retrospective_outcome_read_task", "validation", "4"),
+    ),
+)
+def test_retrospective_producers_are_additive_and_keep_old_sample_wire(
+    tmp_path, kind, purpose, marker
+):
+    ledger, f = _ledger(tmp_path, *([RECEIVED_AT] * 12))
+    producer = _producer(kind, marker)
+    record = _record(producer, purpose)
+    ref = ledger.reserve(record, producer)
+    assert ledger.reserve(record, producer) == ref
+    entry = f.entries(SAMPLE_LOG, ref)[-1]
+    wire = json.loads(entry.payload)
+    assert set(wire["payload"]) == {"record", "producer_ref"}
+    assert wire["payload"]["record"]["purpose"] == purpose
+    wrong = "validation" if purpose != "validation" else "discovery"
+    with pytest.raises(ValueError, match="purpose"):
+        ledger.reserve(_record(producer, wrong), producer)
+    with pytest.raises(ValueError, match="consumer"):
+        ledger.reserve(
+            SampleConsumptionRecord(
+                record.dataset_revision,
+                record.interval_start,
+                record.interval_end,
+                purpose,
+                "not-the-canonical-consumer",
+                record.consumed_at,
+            ),
+            producer,
+        )
+    assert len(f.entries(SAMPLE_LOG)) == 1
+
+
+def test_unknown_producer_is_still_rejected(tmp_path):
+    ledger, f = _ledger(tmp_path, RECEIVED_AT)
+    producer = _producer("retrospective_unknown_read_task", "f")
+    with pytest.raises(ValueError, match="purpose"):
+        ledger.reserve(_record(producer, "discovery"), producer)
+    assert not f.entries(SAMPLE_LOG)

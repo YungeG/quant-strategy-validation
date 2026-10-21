@@ -32,6 +32,13 @@ _PURPOSE_BY_PRODUCER = {
     "trial_declaration": "discovery",
     "selection_declaration": "selection",
     "validation_case": "validation",
+    "statistical_feature_read_task": "feature_build",
+    "statistical_training_read_task": "model_training",
+    "statistical_outcome_read_task": "validation",
+    "retrospective_input_read_task": "discovery",
+    "retrospective_feature_read_task": "feature_build",
+    "retrospective_training_read_task": "model_training",
+    "retrospective_outcome_read_task": "validation",
 }
 
 
