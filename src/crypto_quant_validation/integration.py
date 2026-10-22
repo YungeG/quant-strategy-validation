@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from types import MappingProxyType
 from typing import Any
 
 from .sample_consumption import (
@@ -522,6 +523,48 @@ class ModelBuildGraph:
         ):
             if type(getattr(self, name)) is not ResolvedArtifact:
                 raise ValueError(f"{name} must be a ResolvedArtifact")
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedCandidateProvenance:
+    """Identity binding from a trusted read-only verifier, not a stored certificate."""
+
+    candidate_ref: object
+    candidate_family_ref: object
+    experiment_ref: object
+    execution_manifest_ref: object
+    selection_declaration_ref: object
+    manifest_cutoff_ref: object
+
+    def __post_init__(self) -> None:
+        kinds = {
+            "candidate_ref": ("strategy_candidate", (1, 2, 3)),
+            "candidate_family_ref": ("candidate_family", (1,)),
+            "experiment_ref": ("experiment_spec", (1, 2)),
+            "execution_manifest_ref": ("experiment_execution_manifest", (1,)),
+            "selection_declaration_ref": ("selection_declaration", (1,)),
+        }
+        for name, (kind, versions) in kinds.items():
+            value = getattr(self, name)
+            if not any(
+                _artifact_ref_matches(value, kind, version)
+                and type(value["schema_version"]) is int
+                for version in versions
+            ):
+                raise ValueError(f"{name} must be a canonical {kind} reference")
+            object.__setattr__(self, name, MappingProxyType(deepcopy(value)))
+        cutoff = self.manifest_cutoff_ref
+        if (
+            type(cutoff) is not dict
+            or set(cutoff) != {"log_name", "log_sequence", "receipt_hash"}
+            or cutoff["log_name"] != "research.execution.v1"
+            or type(cutoff["log_sequence"]) is not int
+            or cutoff["log_sequence"] <= 0
+            or type(cutoff["receipt_hash"]) is not str
+            or _HASH.fullmatch(cutoff["receipt_hash"]) is None
+        ):
+            raise ValueError("manifest_cutoff_ref must be a canonical Research cutoff")
+        object.__setattr__(self, "manifest_cutoff_ref", MappingProxyType(deepcopy(cutoff)))
 
 
 @dataclass(frozen=True, slots=True)
