@@ -309,6 +309,46 @@ class SampleConsumptionLedger:
             _conflict()
         return receipt.entry_ref
 
+    def require_reservation(
+        self,
+        record: SampleConsumptionRecord,
+        producer_ref: ArtifactRef,
+        *,
+        before_entry_ref: LogEntryRef | None = None,
+    ) -> LogEntryRef:
+        """Return an original reservation, optionally before another original entry."""
+        record = _record(record)
+        producer_ref = _artifact_ref(producer_ref, "producer_ref")
+        if type(producer_ref.schema_version) is not int:
+            raise ValueError("producer_ref schema_version must be an exact integer")
+        _validate_pair(record, producer_ref)
+        if before_entry_ref is not None and type(before_entry_ref) is not LogEntryRef:
+            raise TypeError("before_entry_ref must be a LogEntryRef or None")
+        expected_payload = canonical_bytes(
+            ArtifactEnvelope.create(
+                _APPEND_TYPE,
+                1,
+                {"record": _record_wire(record), "producer_ref": producer_ref},
+            )
+        )
+        event_id = _reservation_event_id(record, producer_ref)
+        bound = (
+            None
+            if before_entry_ref is None
+            else self._foundation.entries(before_entry_ref.log_name, before_entry_ref)[-1]
+        )
+        matches = []
+        for entry in self._foundation.entries(_SAMPLE_LOG):
+            _append_record(entry.payload, entry.event_id, entry.accepted_at)
+            if entry.event_id == event_id:
+                matches.append(entry)
+        if len(matches) != 1 or matches[0].payload != expected_payload:
+            _conflict()
+        reservation = matches[0]
+        if bound is not None and reservation.ledger_sequence >= bound.ledger_sequence:
+            _conflict()
+        return reservation.entry_ref
+
     def freeze_snapshot(self) -> ArtifactRef:
         checkpoint = self._foundation.checkpoint(_SAMPLE_LOG)
         return self._publish(_SNAPSHOT_TYPE, {"checkpoint": _checkpoint_wire(checkpoint)})
