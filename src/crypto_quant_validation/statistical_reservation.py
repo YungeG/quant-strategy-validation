@@ -872,6 +872,14 @@ def reserve_statistical_read(
             "STATISTICAL_PUBLICATION_MISSING",
             TypeError("foundation must be LocalFoundation"),
         )
+    try:
+        if type(ledger) is not SampleConsumptionLedger:
+            raise TypeError("ledger must be the public SampleConsumptionLedger")
+        ledger.require_foundation(foundation)
+    except Exception as error:
+        raise StatisticalReservationError(
+            "STATISTICAL_RESERVATION_FAILED"
+        ) from error
     study_pub, study_envelope, study_source = _read_declaration(
         foundation, study_publication
     )
@@ -984,8 +992,6 @@ def reserve_statistical_read(
         )
 
     try:
-        if type(ledger) is not SampleConsumptionLedger:
-            raise TypeError("ledger must be the public SampleConsumptionLedger")
         record = _intended_record(task_pub[0], task, consumed_at)
         if current_sample_checkpoint is None:
             current_sample_checkpoint, _ = _current_entries(foundation, _SAMPLE_LOG)

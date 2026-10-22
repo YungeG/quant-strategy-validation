@@ -1034,6 +1034,7 @@ def validate_candidate(
         raise TypeError("sample_ledger must be a SampleConsumptionLedger")
     if type(fresh) is not bool:
         raise TypeError("fresh must be a bool")
+    sample_ledger.require_foundation(foundation)
     _require_backtest(backtest)
 
     existing: tuple[ArtifactRef, dict[str, object]] | None = None

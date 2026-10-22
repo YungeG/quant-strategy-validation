@@ -1594,6 +1594,7 @@ def validate_target_candidate(
         raise TypeError("foundation must be a LocalFoundation")
     if type(sample_ledger) is not SampleConsumptionLedger:
         raise TypeError("sample_ledger must be a SampleConsumptionLedger")
+    sample_ledger.require_foundation(foundation)
     _require_ports(materializer, backtest)
 
     try:

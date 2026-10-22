@@ -289,6 +289,13 @@ class SampleConsumptionLedger:
             raise TypeError("foundation must be a LocalFoundation")
         self._foundation = foundation
 
+    def require_foundation(self, foundation: LocalFoundation) -> None:
+        """Require the exact authority object without touching storage or time."""
+        if type(foundation) is not LocalFoundation:
+            raise TypeError("foundation must be a LocalFoundation")
+        if self._foundation is not foundation:
+            _conflict()
+
     def reserve(
         self, record: SampleConsumptionRecord, producer_ref: ArtifactRef
     ) -> LogEntryRef:

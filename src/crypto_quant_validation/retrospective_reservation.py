@@ -510,6 +510,14 @@ def reserve_retrospective_read(
     """Reserve the declared local-capture observation, never permission to read."""
     if type(foundation) is not LocalFoundation:
         raise RetrospectiveReservationError("RETROSPECTIVE_PUBLICATION_MISSING")
+    try:
+        if type(ledger) is not SampleConsumptionLedger:
+            raise TypeError("ledger must be the public SampleConsumptionLedger")
+        ledger.require_foundation(foundation)
+    except Exception as error:
+        raise RetrospectiveReservationError(
+            "RETROSPECTIVE_RESERVATION_FAILED"
+        ) from error
     pp, pe, pbytes = _read(foundation, protocol_publication)
     try:
         p = _protocol(pe)
@@ -604,11 +612,6 @@ def reserve_retrospective_read(
             "RETROSPECTIVE_PREREQUISITE_INVALID"
         ) from error
     try:
-        if (
-            type(ledger) is not SampleConsumptionLedger
-            or ledger._foundation is not foundation
-        ):
-            raise ValueError("ledger must belong to the same Foundation")
         record = _intended(tp[0], t, consumed_at)
         checkpoint = foundation.checkpoint(_SAMPLE)
         if (

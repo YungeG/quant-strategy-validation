@@ -1428,30 +1428,37 @@ def test_returned_sample_reference_requires_actual_exact_record(
 
 
 def test_different_foundation_and_ledger_cannot_return_a_success_receipt(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     case = _case(tmp_path / "requested")
     other = LocalFoundation(tmp_path / "other", clock=lambda: CLOCK)
+    ledger = SampleConsumptionLedger(other)
     evidence = _evidence(case)
-    error = _rejected(
-        "RESERVATION_FAILED",
-        lambda: reserve_statistical_read(
-            case.foundation,
-            SampleConsumptionLedger(other),
-            case.study_pub,
-            case.tasks["HELD_OUT_FEATURE"],
-            AT,
-            evidence,
-        ),
-    )
-    assert (
-        isinstance(error.__cause__, FoundationFailure)
-        and error.__cause__.code == "LOG_INTEGRITY"
-    )
-    assert len(_entries(case, BINDING_LOG)) == 1 and _entries(case, SAMPLE_LOG) == ()
-    assert (
-        len(other.entries(SAMPLE_LOG, other.checkpoint(SAMPLE_LOG))) == 1
-    )  # No claimed cross-store rollback.
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        calls.append("io")
+        raise AssertionError("foreign ledger must fail before declaration or binding I/O")
+
+    with monkeypatch.context() as guarded:
+        for name in ("read", "entries", "put", "append", "checkpoint"):
+            guarded.setattr(LocalFoundation, name, forbidden)
+        error = _rejected(
+            "RESERVATION_FAILED",
+            lambda: reserve_statistical_read(
+                case.foundation,
+                ledger,
+                case.study_pub,
+                case.tasks["HELD_OUT_FEATURE"],
+                AT,
+                evidence,
+            ),
+        )
+    assert isinstance(error.__cause__, ValidationCoreFailure)
+    assert error.__cause__.code == "SAMPLE_LEDGER_CONFLICT"
+    assert calls == []
+    assert _entries(case, BINDING_LOG) == _entries(case, SAMPLE_LOG) == ()
+    assert other.entries(SAMPLE_LOG, other.checkpoint(SAMPLE_LOG)) == ()
 
 
 def test_every_new_lookup_has_a_cutoff_and_no_evidence_is_refreshed(
