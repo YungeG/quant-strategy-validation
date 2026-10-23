@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from crypto_quant_domain import (
     ArtifactEnvelope,
@@ -35,6 +35,7 @@ from .integration import (
     ValidationPlan,
     ValidationPolicy,
     ValidationReport,
+    VerifiedCandidateProvenance,
     _backtest_ref_version,
     aggregate_validation_report,
     assess_admission,
@@ -47,6 +48,10 @@ from .sample_consumption import (
     assess_untouched_holdout,
     build_snapshot,
 )
+
+CandidateProvenanceVerifier = Callable[
+    [ArtifactRef, LocalFoundation, object], VerifiedCandidateProvenance
+]
 
 _ARTIFACT_LOG = "validation.artifacts.v1"
 _RESEARCH_ARTIFACT_LOG = "research.artifacts.v1"
@@ -94,7 +99,7 @@ def _artifact_ref(value: object, name: str) -> ArtifactRef:
         )
     except (AttributeError, TypeError, ValueError) as error:
         raise ValueError(f"{name} must be canonical") from error
-    if normalized != value:
+    if type(value.schema_version) is not int or normalized != value:
         raise ValueError(f"{name} must be canonical")
     return normalized
 
@@ -110,7 +115,7 @@ def _ref_from_wire(value: object) -> ArtifactRef:
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("artifact ref wire is invalid") from error
-    if value != ref.to_canonical_dict():
+    if type(value.get("schema_version")) is not int or value != ref.to_canonical_dict():
         raise ValueError("artifact ref wire is not canonical")
     return ref
 
@@ -277,11 +282,24 @@ def _candidate_graph(
     backtest: object,
     reservation_at: str,
     candidate_schema_versions: tuple[int, ...] = (1, 2),
+    candidate_provenance_verifier: CandidateProvenanceVerifier | None = None,
 ) -> tuple[
     CandidateGraph,
     tuple[tuple[SampleConsumptionRecord, ArtifactRef, LogEntryRef], ...],
 ]:
     try:
+        if candidate_provenance_verifier is None:
+            raise _GraphFailure()
+        try:
+            provenance = candidate_provenance_verifier(candidate_ref, foundation, backtest)
+        except FoundationFailure:
+            raise
+        except (TypeError, ValueError) as error:
+            raise _GraphFailure() from error
+        except Exception as error:
+            raise _GraphFailure(_failure_code(error)) from error
+        if type(provenance) is not VerifiedCandidateProvenance:
+            raise _GraphFailure()
         candidate, candidate_payload = _node(
             foundation,
             candidate_ref,
@@ -303,6 +321,25 @@ def _candidate_graph(
             "experiment_execution_manifest",
             _RESEARCH_EXECUTION_LOG,
         )
+        manifest_bytes = foundation.read(ref=manifest_ref).source_bytes
+        manifest_entries = [
+            entry for entry in foundation.entries(_RESEARCH_EXECUTION_LOG)
+            if entry.event_id == _event_id(_RESEARCH_EXECUTION_LOG, manifest_ref)
+            and entry.payload == manifest_bytes
+        ]
+        bindings = (
+            (provenance.candidate_ref, _wire(candidate_ref)),
+            (provenance.candidate_family_ref, _wire(family_ref)),
+            (provenance.experiment_ref, family_payload["experiment_ref"]),
+            (provenance.execution_manifest_ref, _wire(manifest_ref)),
+            (provenance.selection_declaration_ref, _wire(selection_ref)),
+        )
+        if len(manifest_entries) != 1 or any(
+            canonical_bytes(bound) != canonical_bytes(actual) for bound, actual in bindings
+        ) or canonical_bytes(provenance.manifest_cutoff_ref) != canonical_bytes(
+            _entry_ref_wire(manifest_entries[0].entry_ref)
+        ):
+            raise _GraphFailure()
         selection, selection_payload = _node(
             foundation,
             selection_ref,
@@ -556,6 +593,7 @@ def _candidate_graph(
                 analysis,
                 required_records,
                 model_build,
+                provenance,
             ),
             entries,
         )
@@ -625,6 +663,8 @@ def _snapshot_evidence(
         _ARTIFACT_LOG,
     )
     try:
+        if set(snapshot_payload) != {"checkpoint"}:
+            raise ValueError("snapshot payload is invalid")
         raw_checkpoint = snapshot_payload["checkpoint"]
         if type(raw_checkpoint) is not dict or set(raw_checkpoint) != {
             "log_name",
@@ -678,7 +718,7 @@ def _snapshot_evidence(
         _checkpoint_wire(checkpoint),
         snapshot,
         integrity,
-        assessment != expected_assessment,
+        canonical_bytes(assessment) != canonical_bytes(expected_assessment),
     )
 
 
@@ -757,7 +797,7 @@ def _existing_plan(
             continue
         candidate_expected = dict(expected)
         candidate_expected["sample_consumption_snapshot_ref"] = snapshot
-        if payload == candidate_expected:
+        if canonical_bytes(payload) == canonical_bytes(candidate_expected):
             matches.append((ref, payload))
     if not matches:
         return None
@@ -767,12 +807,88 @@ def _existing_plan(
     return ref, payload
 
 
+def _case_ref(plan_ref: ArtifactRef, case_type: str) -> ArtifactRef:
+    return ArtifactRef.from_envelope(ArtifactEnvelope.create(
+        "validation_case", 1,
+        {"validation_plan_ref": _wire(plan_ref), "case_type": case_type},
+    ))
+
+
+def _existing_case_result(
+    foundation: LocalFoundation,
+    case_ref: ArtifactRef,
+    plan_ref: ArtifactRef,
+    case_type: str,
+) -> tuple[ArtifactRef, dict[str, object]]:
+    expected_case = {"validation_plan_ref": _wire(plan_ref), "case_type": case_type}
+    if _published(foundation, case_ref, "validation_case", _ARTIFACT_LOG) != expected_case:
+        raise _GraphFailure()
+    matches = [
+        (ref, payload) for ref, payload in _artifact_log_payloads(foundation)
+        if ref.artifact_type == "validation_case_result"
+        and payload.get("case_ref") == _wire(case_ref)
+    ]
+    if len(matches) != 1:
+        raise _GraphFailure()
+    ref, payload = matches[0]
+    if set(payload) != {"case_ref", "outcome", "reason_codes", "limitations", "evidence"}:
+        raise _GraphFailure()
+    if _published(foundation, ref, "validation_case_result", _ARTIFACT_LOG) != payload:
+        raise _GraphFailure()
+    return ref, payload
+
+
+def _replay_oos_result(
+    plan: ValidationPlan,
+    case_ref: ArtifactRef,
+    payload: dict[str, object],
+    backtest: object,
+) -> CaseResult:
+    evidence = payload["evidence"]
+    case_wire = _wire(case_ref)
+    if type(evidence) is not dict:
+        raise _GraphFailure()
+    try:
+        if set(evidence) == {"status", "durable_evidence_ref"}:
+            terminal = backtest.load_terminal(evidence["durable_evidence_ref"])
+            return assess_oos(
+                plan, OosObservation(plan, case_wire, case_wire, terminal), None
+            )
+        if set(evidence) == {"code"}:
+            return assess_oos(plan, ProviderFailure(evidence["code"]), None)
+        if set(evidence) != {
+            "publication_ref", "analysis_ref", "metric_profile_ref",
+            "source_execution_result_hash", "result_grade", "metric_key",
+            "metric_value", "trade_count",
+        }:
+            raise _GraphFailure()
+        _backtest_ref_version(evidence["publication_ref"], "completed")
+        _backtest_ref_version(evidence["analysis_ref"], "analysis")
+        completed = _load_completed(backtest, evidence["publication_ref"])
+        analysis = _load_analysis(backtest, evidence["analysis_ref"])
+        return assess_oos(
+            plan, OosObservation(plan, case_wire, case_wire, completed),
+            AnalysisObservation(plan, case_wire, analysis),
+        )
+    except (FoundationFailure, _GraphFailure):
+        raise
+    except (KeyError, TypeError, ValueError) as error:
+        raise _GraphFailure() from error
+    except Exception as error:
+        raise _GraphFailure(_failure_code(error)) from error
+
+
 def _existing_report(
-    foundation: LocalFoundation, plan_ref: ArtifactRef
+    foundation: LocalFoundation,
+    plan_ref: ArtifactRef,
+    plan: ValidationPlan,
+    graph: CandidateGraph,
+    snapshot_ref: ArtifactRef,
+    policy: ValidationPolicy,
+    backtest: object,
 ) -> PublishedValidationReport | None:
     matches = [
-        (ref, payload)
-        for ref, payload in _artifact_log_payloads(foundation)
+        (ref, payload) for ref, payload in _artifact_log_payloads(foundation)
         if ref.artifact_type == "validation_report"
         and payload.get("validation_plan_ref") == _wire(plan_ref)
     ]
@@ -781,20 +897,62 @@ def _existing_report(
     if len(matches) != 1:
         raise _GraphFailure()
     report_ref, payload = matches[0]
-    if (
-        set(payload)
-        != {
-            "validation_plan_ref",
-            "result",
-            "case_result_refs",
-            "threshold_evaluations",
-            "sample_integrity_ref",
-            "limitations",
-        }
-        or payload["result"] not in {"supported", "rejected", "inconclusive"}
-        or _published(foundation, report_ref, "validation_report", _ARTIFACT_LOG)
-        != payload
+    if _published(foundation, report_ref, "validation_report", _ARTIFACT_LOG) != payload:
+        raise _GraphFailure()
+    assessment_ref = _ref_from_wire(payload["sample_integrity_ref"])
+    evidence = _snapshot_evidence(foundation, snapshot_ref, assessment_ref, policy)
+    if evidence.ledger_conflict:
+        raise _GraphFailure()
+    admission = assess_admission(plan, graph, evidence)
+    admission_case = _case_ref(plan_ref, "evidence_integrity")
+    oos_case = _case_ref(plan_ref, "out_of_sample")
+    admission_ref, admission_payload = _existing_case_result(
+        foundation, admission_case, plan_ref, "evidence_integrity"
+    )
+    oos_ref, oos_payload = _existing_case_result(
+        foundation, oos_case, plan_ref, "out_of_sample"
+    )
+    if payload.get("case_result_refs") != [_wire(admission_ref), _wire(oos_ref)]:
+        raise _GraphFailure()
+    if canonical_bytes(admission_payload) != canonical_bytes(
+        _case_result_payload(admission_case, admission)
     ):
+        raise _GraphFailure()
+    if admission.outcome == "PASS":
+        # Recover the original consumed_at; replay must never synthesize a reservation.
+        records = [
+            record for record, producer, _ in _sample_entries(foundation)
+            if producer == oos_case and record.purpose == "validation"
+        ]
+        if len(records) != 1:
+            raise _GraphFailure()
+        record = SampleConsumptionRecord(
+            plan.holdout.dataset_revision, plan.holdout.interval_start,
+            plan.holdout.interval_end, "validation", _consumer_id(oos_case),
+            records[0].consumed_at,
+        )
+        result_bytes = foundation.read(ref=oos_ref).source_bytes
+        entries = [
+            entry for entry in foundation.entries(_ARTIFACT_LOG)
+            if entry.event_id == _event_id(_ARTIFACT_LOG, oos_ref)
+            and entry.payload == result_bytes
+        ]
+        if len(entries) != 1:
+            raise _GraphFailure()
+        SampleConsumptionLedger(foundation).require_reservation(
+            record, oos_case, before_entry_ref=entries[0].entry_ref,
+        )
+        oos = _replay_oos_result(plan, oos_case, oos_payload, backtest)
+    else:
+        oos = _blocked_oos(plan, admission)
+    if canonical_bytes(oos_payload) != canonical_bytes(
+        _case_result_payload(oos_case, oos)
+    ):
+        raise _GraphFailure()
+    report = aggregate_validation_report(plan, (admission, oos))
+    if report is None or canonical_bytes(payload) != canonical_bytes(_report_payload(
+        report, plan_ref, (admission_ref, oos_ref), assessment_ref,
+    )):
         raise _GraphFailure()
     return PublishedValidationReport(plan_ref, report_ref)
 
@@ -1011,8 +1169,9 @@ def validate_candidate(
     backtest: object,
     *,
     fresh: bool = False,
+    candidate_provenance_verifier: CandidateProvenanceVerifier | None = None,
 ) -> PublishedValidationReport | NoReport:
-    """Publish one fixture-backed Validation result without a provider seam."""
+    """Validate a provenance-bound candidate through caller-supplied evidence ports."""
 
     candidate_ref = _artifact_ref(candidate_ref, "candidate_ref")
     if type(policy) is not ValidationPolicy:
@@ -1035,6 +1194,10 @@ def validate_candidate(
     if type(fresh) is not bool:
         raise TypeError("fresh must be a bool")
     sample_ledger.require_foundation(foundation)
+    if candidate_provenance_verifier is None:
+        return NoReport(None, "CANDIDATE_PROVENANCE_INVALID")
+    if not callable(candidate_provenance_verifier):
+        raise TypeError("candidate_provenance_verifier must be callable")
     _require_backtest(backtest)
 
     existing: tuple[ArtifactRef, dict[str, object]] | None = None
@@ -1046,23 +1209,27 @@ def validate_candidate(
         existing = None if fresh else _existing_plan(foundation, candidate_ref, policy)
         if existing is not None:
             plan_ref, plan_payload = existing
-            published = _existing_report(foundation, plan_ref)
-            if published is not None:
-                return published
             snapshot_ref = _ref_from_wire(
                 plan_payload["sample_consumption_snapshot_ref"]
             )
             plan = build_validation_plan(
                 _wire(candidate_ref), _wire(snapshot_ref), policy
             )
-            if _plan_payload(plan) != plan_payload:
+            if canonical_bytes(_plan_payload(plan)) != canonical_bytes(plan_payload):
                 raise _GraphFailure()
             graph, _ = _candidate_graph(
-                candidate_ref, foundation, backtest, reservation_at
+                candidate_ref, foundation, backtest, reservation_at,
+                candidate_provenance_verifier=candidate_provenance_verifier,
             )
+            published = _existing_report(
+                foundation, plan_ref, plan, graph, snapshot_ref, policy, backtest
+            )
+            if published is not None:
+                return published
         else:
             graph, entries = _candidate_graph(
-                candidate_ref, foundation, backtest, reservation_at
+                candidate_ref, foundation, backtest, reservation_at,
+                candidate_provenance_verifier=candidate_provenance_verifier,
             )
             preflight = _preflight_admission(
                 candidate_ref, policy, graph, entries, reservation_at
@@ -1146,4 +1313,4 @@ def validate_candidate(
     return PublishedValidationReport(plan_ref, report_ref)
 
 
-__all__ = ["NoReport", "PublishedValidationReport", "validate_candidate"]
+__all__ = ["CandidateProvenanceVerifier", "NoReport", "PublishedValidationReport", "validate_candidate"]

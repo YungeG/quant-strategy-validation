@@ -15,6 +15,7 @@ from crypto_quant_domain import (
 )
 from crypto_quant_foundation import LocalFoundation
 from crypto_quant_research import (
+    verify_candidate_provenance,
     DataSlice,
     ExperimentParameterCombination,
     ExperimentSelectionPolicy,
@@ -421,6 +422,7 @@ def test_validation_adapter_composes_only_accepted_research_and_backtest_public_
         ledger,
         validation_materializer,
         public_adapter,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(result) is PublishedValidationReport

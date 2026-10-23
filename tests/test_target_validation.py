@@ -14,7 +14,11 @@ from crypto_quant_domain import (
     canonical_bytes,
     canonical_sha256,
 )
-from crypto_quant_research import PublishedStrategyCandidate, execute_target_experiment
+from crypto_quant_research import (
+    PublishedStrategyCandidate,
+    execute_target_experiment,
+    verify_candidate_provenance,
+)
 
 from crypto_quant_validation import (
     Holdout,
@@ -140,6 +144,7 @@ def test_target_validation_golden_links_full_provenance(
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(result) is PublishedValidationReport
@@ -207,6 +212,7 @@ def test_target_validation_golden_links_full_provenance(
         foundation,
         ledger,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
     assert old == NoReport(None, "CANDIDATE_PROVENANCE_INVALID")
 
@@ -229,6 +235,7 @@ def test_legacy_candidate_v3_rejection_has_no_validation_publication(
         foundation,
         ledger,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert result == NoReport(None, "CANDIDATE_PROVENANCE_INVALID")
@@ -269,6 +276,7 @@ def test_closed_replay_only_revalidates_target_loads(
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
     assert governance_calls == {"assess": 1, "reserve": 1, "freeze": 1}
     before = (
@@ -284,6 +292,12 @@ def test_closed_replay_only_revalidates_target_loads(
         dict(governance_calls),
     )
 
+    def forbidden(*args, **kwargs):
+        pytest.fail("closed target replay wrote storage or consulted the clock")
+
+    for name in ("put", "append", "checkpoint", "_clock"):
+        monkeypatch.setattr(foundation, name, forbidden)
+
     second = validate_target_candidate(
         candidate.strategy_candidate_ref,
         _policy(),
@@ -292,6 +306,7 @@ def test_closed_replay_only_revalidates_target_loads(
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert second == first
@@ -337,6 +352,7 @@ def test_target_cas_orphan_rematerializes_but_runs_economics_once(
             ledger,
             materializer,
             backtest,
+            candidate_provenance_verifier=verify_candidate_provenance,
         )
     monkeypatch.setattr(backtest.delegate, "publish_target", publish)
     validate_target_candidate(
@@ -347,6 +363,7 @@ def test_target_cas_orphan_rematerializes_but_runs_economics_once(
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert materializer.calls == 3
@@ -381,6 +398,7 @@ def test_evidence_commit_and_preparation_interruptions_do_not_rematerialize_or_r
             ledger,
             materializer,
             backtest,
+            candidate_provenance_verifier=verify_candidate_provenance,
         )
     monkeypatch.setattr(target_runtime, "_publish", publish)
     backtest.interrupt_after_prepare = True
@@ -393,6 +411,7 @@ def test_evidence_commit_and_preparation_interruptions_do_not_rematerialize_or_r
             ledger,
             materializer,
             backtest,
+            candidate_provenance_verifier=verify_candidate_provenance,
         )
     result = validate_target_candidate(
         candidate.strategy_candidate_ref,
@@ -402,6 +421,7 @@ def test_evidence_commit_and_preparation_interruptions_do_not_rematerialize_or_r
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(result) is PublishedValidationReport
@@ -435,6 +455,7 @@ def test_committed_evidence_recovery_exact_load_rejects_tamper(
             ledger,
             materializer,
             backtest,
+            candidate_provenance_verifier=verify_candidate_provenance,
         )
     monkeypatch.setattr(target_runtime, "_publish", publish)
     load = backtest.load_target
@@ -455,6 +476,7 @@ def test_committed_evidence_recovery_exact_load_rejects_tamper(
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(result) is NoReport
@@ -487,6 +509,7 @@ def test_committed_evidence_event_count_recovery_rejects_valid_bound_target(
             ledger,
             materializer,
             backtest,
+            candidate_provenance_verifier=verify_candidate_provenance,
         )
     monkeypatch.setattr(target_runtime, "_publish", publish)
     before = (materializer.calls, backtest.store_calls, backtest.preparation_calls)
@@ -499,6 +522,7 @@ def test_committed_evidence_event_count_recovery_rejects_valid_bound_target(
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert result == NoReport(result.validation_plan_ref, "TARGET_STORE_INVALID")
@@ -566,6 +590,7 @@ def test_committed_oos_case_mutation_rejects_without_rerunning_economics(
             ledger,
             materializer,
             backtest,
+            candidate_provenance_verifier=verify_candidate_provenance,
         )
     monkeypatch.setattr(target_runtime, "_publish", publish)
     before = (
@@ -584,6 +609,7 @@ def test_committed_oos_case_mutation_rejects_without_rerunning_economics(
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert result == NoReport(result.validation_plan_ref, "CASE_COVER_INVALID")
@@ -624,6 +650,7 @@ def test_committed_terminal_case_evidence_mutation_rejects_without_reexecution(
             ledger,
             materializer,
             backtest,
+            candidate_provenance_verifier=verify_candidate_provenance,
         )
     monkeypatch.setattr(target_runtime, "_publish", publish)
     before = (
@@ -642,6 +669,7 @@ def test_committed_terminal_case_evidence_mutation_rejects_without_reexecution(
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert result == NoReport(result.validation_plan_ref, "CASE_COVER_INVALID")
@@ -726,6 +754,7 @@ def test_report_replay_rejects_forged_links_and_derived_fields(
             ledger,
             materializer,
             backtest,
+            candidate_provenance_verifier=verify_candidate_provenance,
         )
     monkeypatch.setattr(target_runtime, "_publish", publish)
     assert assessment_calls == 1
@@ -745,6 +774,7 @@ def test_report_replay_rejects_forged_links_and_derived_fields(
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(result) is NoReport
@@ -783,6 +813,7 @@ def test_run_return_case_result_and_report_interruptions_use_cache_then_stop(
             ledger,
             materializer,
             backtest,
+            candidate_provenance_verifier=verify_candidate_provenance,
         )
     monkeypatch.setattr(backtest.delegate, "run", run)
     publish = target_runtime._publish
@@ -813,6 +844,7 @@ def test_run_return_case_result_and_report_interruptions_use_cache_then_stop(
             ledger,
             materializer,
             backtest,
+            candidate_provenance_verifier=verify_candidate_provenance,
         )
     with pytest.raises(KeyboardInterrupt):
         validate_target_candidate(
@@ -823,6 +855,7 @@ def test_run_return_case_result_and_report_interruptions_use_cache_then_stop(
             ledger,
             materializer,
             backtest,
+            candidate_provenance_verifier=verify_candidate_provenance,
         )
     monkeypatch.setattr(target_runtime, "_publish", publish)
     result = validate_target_candidate(
@@ -833,6 +866,7 @@ def test_run_return_case_result_and_report_interruptions_use_cache_then_stop(
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(result) is PublishedValidationReport
@@ -869,6 +903,7 @@ def test_target_boundary_failures_are_validation_local(
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert result == NoReport(result.validation_plan_ref, reason)
@@ -894,6 +929,7 @@ def test_materializer_strategy_identity_fails_before_materialization_read(
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert result == NoReport(result.validation_plan_ref, "TARGET_MATERIALIZATION_INVALID")
@@ -916,6 +952,7 @@ def test_materializer_artifact_request_and_result_shape_fail_before_target_store
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(result) is NoReport
@@ -963,6 +1000,7 @@ def test_target_ref_context_digest_count_load_and_retention_fail_before_evidence
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(result) is NoReport
@@ -993,6 +1031,7 @@ def test_validation_evidence_publication_failure_is_the_commit_barrier(
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(result) is NoReport
@@ -1027,6 +1066,7 @@ def test_backtest_terminal_outcomes_are_normalized_without_analysis(
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(result) is result_type
@@ -1061,6 +1101,7 @@ def test_holdout_reservation_failure_precedes_materialization(
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert result.reason_code == "SAMPLE_LEDGER_CONFLICT"
@@ -1083,6 +1124,7 @@ def test_oos_reservation_recovery_requires_one_exact_preceding_append(
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
     assert type(first) is PublishedValidationReport
     original_entries = foundation.entries
@@ -1144,6 +1186,7 @@ def test_oos_reservation_recovery_requires_one_exact_preceding_append(
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert result == NoReport(result.validation_plan_ref, "SAMPLE_LEDGER_CONFLICT")
@@ -1179,6 +1222,7 @@ def test_discovery_target_ref_substitution_is_rejected_even_for_equal_stream(
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(result) is NoReport
@@ -1213,6 +1257,7 @@ def test_candidate_v3_substituted_target_evidence_fails_before_validation_public
         ledger,
         materializer,
         backtest,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert result == NoReport(None, "CANDIDATE_PROVENANCE_INVALID")
@@ -1268,3 +1313,24 @@ def test_target_runtime_has_no_research_or_backtest_production_import() -> None:
     assert "crypto_quant_backtest" not in source
     assert "Protocol" not in source
     assert "generic loader" not in source.lower()
+
+
+def test_closed_report_replay_preserves_assessment_infrastructure_failure(tmp_path, monkeypatch):
+    from crypto_quant_foundation import FoundationFailure
+
+    foundation, ledger, materializer, backtest, candidate = _runtime(tmp_path)
+    args = (candidate.strategy_candidate_ref, _policy(), _RESEARCH.RESERVED_AT,
+            foundation, ledger, materializer, backtest)
+    first = validate_target_candidate(*args, candidate_provenance_verifier=verify_candidate_provenance)
+    assert type(first) is PublishedValidationReport
+    read = foundation.read
+
+    def unavailable(*, ref):
+        if ref.artifact_type == "sample_integrity_assessment":
+            raise FoundationFailure("WRITE_LOCK_UNAVAILABLE")
+        return read(ref=ref)
+
+    monkeypatch.setattr(foundation, "read", unavailable)
+    with pytest.raises(FoundationFailure) as caught:
+        validate_target_candidate(*args, candidate_provenance_verifier=verify_candidate_provenance)
+    assert caught.value.code == "WRITE_LOCK_UNAVAILABLE"

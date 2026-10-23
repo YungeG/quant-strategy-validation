@@ -29,12 +29,14 @@ from .integration import (
 )
 from .ledger import SampleConsumptionLedger
 from .runtime import (
+    CandidateProvenanceVerifier,
     NoReport,
     PublishedValidationReport,
     _artifact_log_payloads,
     _candidate_graph,
     _consumer_id,
     _failure_code,
+    _GraphFailure,
     _is_terminal_ref,
     _load_analysis,
     _load_completed,
@@ -576,6 +578,7 @@ def _target_context(
     foundation: LocalFoundation,
     backtest: Any,
     reservation_at: str,
+    candidate_provenance_verifier: CandidateProvenanceVerifier,
 ):
     candidate = _published(
         foundation,
@@ -587,7 +590,8 @@ def _target_context(
     if set(candidate) != _CANDIDATE_V3_FIELDS:
         raise ValueError("candidate@3 fields are invalid")
     graph, sample_entries = _candidate_graph(
-        candidate_ref, foundation, backtest, reservation_at, (3,)
+        candidate_ref, foundation, backtest, reservation_at, (3,),
+        candidate_provenance_verifier=candidate_provenance_verifier,
     )
     base_candidate = dict(candidate)
     evidence_wire = base_candidate.pop("selected_target_materialization_evidence_ref")
@@ -957,10 +961,18 @@ def _closed_report_replay(
         admission_evidence = _snapshot_evidence(
             foundation, snapshot_ref, assessment_ref, policy
         )
-    except (FoundationFailure, KeyError, TypeError, ValueError) as error:
+    except FoundationFailure as error:
+        if error.code != "ARTIFACT_NOT_FOUND":
+            raise
         raise ValueError(
             "ValidationReport@2 sample integrity link is invalid"
         ) from error
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            "ValidationReport@2 sample integrity link is invalid"
+        ) from error
+    if admission_evidence.ledger_conflict:
+        raise ValueError("ValidationReport@2 sample assessment mismatch")
     admission = assess_admission(plan, graph, admission_evidence)
     admission_payload = _case_result_payload(evidence_case_ref, admission, None)
     admission_existing = _existing_case_result(
@@ -1565,6 +1577,8 @@ def validate_target_candidate(
     sample_ledger: SampleConsumptionLedger,
     materializer: object,
     backtest: object,
+    *,
+    candidate_provenance_verifier: CandidateProvenanceVerifier | None = None,
 ) -> PublishedValidationReport | NoReport:
     """Validate an exact StrategyCandidate@3 through independent OOS targets."""
 
@@ -1595,11 +1609,16 @@ def validate_target_candidate(
     if type(sample_ledger) is not SampleConsumptionLedger:
         raise TypeError("sample_ledger must be a SampleConsumptionLedger")
     sample_ledger.require_foundation(foundation)
+    if candidate_provenance_verifier is None:
+        return NoReport(None, "CANDIDATE_PROVENANCE_INVALID")
+    if not callable(candidate_provenance_verifier):
+        raise TypeError("candidate_provenance_verifier must be callable")
     _require_ports(materializer, backtest)
 
     try:
         graph, sample_entries, context = _target_context(
-            candidate_ref, foundation, backtest, reservation_at
+            candidate_ref, foundation, backtest, reservation_at,
+            candidate_provenance_verifier,
         )
         existing = _existing_plan(foundation, candidate_ref, policy, context)
         if existing is None:
@@ -1624,6 +1643,8 @@ def validate_target_candidate(
         if error.code == "ARTIFACT_NOT_FOUND":
             return NoReport(None, "CANDIDATE_PROVENANCE_INVALID")
         raise
+    except _GraphFailure as error:
+        return NoReport(None, error.code)
     except Exception:
         return NoReport(None, "CANDIDATE_PROVENANCE_INVALID")
 

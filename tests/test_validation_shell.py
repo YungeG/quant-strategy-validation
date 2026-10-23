@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.util
 import json
 import sys
 from collections.abc import Callable
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from crypto_quant_research import verify_candidate_provenance
 from crypto_quant_domain import (
     ArtifactEnvelope,
     ArtifactRef,
@@ -113,6 +116,7 @@ def _policy(
 class RecordingPort(InMemoryBacktestConsumerPort):
     def __init__(self, foundation: LocalFoundation) -> None:
         super().__init__()
+        _add_research_cases(self)
         self._foundation = foundation
         self.run_requests: list[dict[str, object]] = []
         self.run_sample_counts: list[int] = []
@@ -135,6 +139,7 @@ class RecordingPort(InMemoryBacktestConsumerPort):
 class DecisionGradePort(RecordingPort):
     def __init__(self, foundation: LocalFoundation) -> None:
         InMemoryBacktestConsumerPort.__init__(self, contract_path=CONTRACT_V2_PATH)
+        _add_research_cases(self)
         self._foundation = foundation
         self.run_requests = []
         self.run_sample_counts = []
@@ -164,17 +169,15 @@ class OosAnalysisPort(RecordingPort):
     ) -> None:
         super().__init__(foundation)
         self._mutate = mutate
-        self._analysis_loads = 0
 
     def load_analysis(self, analysis_ref: dict) -> dict:
-        self._analysis_loads += 1
         record = super().load_analysis(analysis_ref)
-        if self._analysis_loads >= 2:
+        if analysis_ref == self.case("adverse_completed")["analysis"]["analysis_ref"]:
             self._mutate(record)
         return record
 
 
-def _candidate(
+def _incomplete_candidate(
     foundation: LocalFoundation,
     ledger: SampleConsumptionLedger,
     port: InMemoryBacktestConsumerPort,
@@ -329,6 +332,59 @@ def _candidate(
     return candidate_ref
 
 
+def _candidate(
+    foundation: LocalFoundation,
+    ledger: SampleConsumptionLedger,
+    port: RecordingPort,
+    *,
+    case_id: str = "adverse_completed",
+    grade: str = "development",
+) -> ArtifactRef:
+    """Produce actual Research closure; the incomplete writer above is negative/history only."""
+    from crypto_quant_research import FrozenExperimentInputs, TrialExecution, execute_experiment
+    from crypto_quant_research.integration import DataSlice, build_trial_declarations
+    path = ROOT / "research-platform/tests/test_research_shell.py"
+    spec_module = importlib.util.spec_from_file_location("validation_research_fixture", path)
+    module = importlib.util.module_from_spec(spec_module)
+    spec_module.loader.exec_module(module)
+    source = module._spec() if grade == "development" else module._decision_grade_inputs().experiment_spec
+    spec = replace(
+        source, data_slices=(DataSlice(source.data_slices[0].market_bundle_ref, "eth-usdt-v1", DATA_START, DATA_END),),
+        parameter_combinations=source.parameter_combinations[:1], seeds=(1,), budget={"max_trials": 1},
+    )
+    trial = build_trial_declarations(spec)[0]
+    inputs = FrozenExperimentInputs(
+        spec, module._policy(spec, grades=(grade,)), {"type": "actor_ref", "actor_id": "research"},
+        (TrialExecution(trial.ref, {"fixture_case": "research:" + case_id}, {"type": "backtest_request_ref", "id": "fixture"}),),
+        RESERVED_AT,
+    )
+    result = execute_experiment(inputs, foundation, ledger, port)
+    port.research_run_count = len(port.run_requests)
+    port.research_derive_count = port.derive_calls
+    return result.strategy_candidate_ref
+
+
+def _add_research_cases(port: InMemoryBacktestConsumerPort) -> None:
+    # Separate immutable records, never call-order-dependent evidence for one ref.
+    for original in tuple(port._contract["cases"]):
+        field = "completed_v3" if "completed_v3" in original else "completed"
+        if field not in original:
+            continue
+        case = deepcopy(original)
+        case["case_id"] = "research:" + original["case_id"]
+        case["request_spec"] = {"fixture_case": case["case_id"]}
+        for ref in (case["run"]["ref"], case[field]["publication_ref"], case["analysis_v2" if field == "completed_v3" else "analysis"]["source_publication_ref"]):
+            ref["artifact_ref"]["content_hash"] = canonical_sha256(("research-publication", original["case_id"]))
+        analysis = case["analysis_v2" if field == "completed_v3" else "analysis"]
+        for ref in (case["derive"]["analysis_ref"], analysis["analysis_ref"]):
+            ref["artifact_ref"]["content_hash"] = canonical_sha256(("research-analysis", original["case_id"]))
+        execution_hash = canonical_sha256(("research-execution", original["case_id"]))
+        case[field]["semantic_run_id"] = "run_" + canonical_sha256(("research-semantic-run", original["case_id"]))[7:]
+        case[field]["execution_result_hash"] = execution_hash
+        analysis["source_execution_result_hash"] = execution_hash
+        port._contract["cases"].append(case)
+
+
 def _setup(
     tmp_path: Path,
     port_type: type[RecordingPort] = RecordingPort,
@@ -373,6 +429,7 @@ def test_adverse_fixture_publishes_rejected_report_after_snapshot_plan_and_reser
         foundation,
         ledger,
         port,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(result) is PublishedValidationReport
@@ -381,8 +438,8 @@ def test_adverse_fixture_publishes_rejected_report_after_snapshot_plan_and_reser
     assert report["result"] == "rejected"
     assert report["validation_plan_ref"] == _wire(result.validation_plan_ref)
     assert plan["candidate_ref"] == _wire(candidate_ref)
-    assert port.run_sample_counts == [3]
-    context_ref = json.loads(port.run_requests[0]["experiment_id"])
+    assert port.run_sample_counts[port.research_run_count:] == [3]
+    context_ref = json.loads(port.run_requests[port.research_run_count]["experiment_id"])
     assert context_ref["artifact_type"] == "validation_case"
     assert foundation.read(
         ref=ArtifactRef(
@@ -391,8 +448,8 @@ def test_adverse_fixture_publishes_rejected_report_after_snapshot_plan_and_reser
             context_ref["content_hash"],
         )
     ).envelope.artifact_type == "validation_case"
-    assert port.derive_calls == 1
-    assert port.run_artifact_types == [
+    assert port.derive_calls - port.research_derive_count == 1
+    assert port.run_artifact_types[port.research_run_count:] == [
         [
             "sample_consumption_ledger_snapshot",
             "validation_plan",
@@ -415,18 +472,55 @@ def test_adverse_fixture_publishes_rejected_report_after_snapshot_plan_and_reser
     assert _oos_result_payload(foundation)["outcome"] == "FAIL"
 
 
-def test_legacy_validation_v1_canonical_bytes_are_frozen(tmp_path: Path) -> None:
-    foundation, ledger, port, candidate_ref, policy = _setup(tmp_path)
-
-    result = validate_candidate(
-        candidate_ref,
-        policy,
-        {"fixture_case": "adverse_completed"},
-        RESERVED_AT,
-        foundation,
-        ledger,
-        port,
+def _historical_wire_report(foundation, ledger, port, candidate_ref, policy):
+    """Pure-kernel serialization history only: this incomplete producer is NOT admitted."""
+    from crypto_quant_validation import (CandidateGraph, ResolvedArtifact, VerifiedCandidateProvenance,
+        assess_admission, assess_oos, aggregate_validation_report, build_validation_plan,
+        OosObservation, AnalysisObservation)
+    from crypto_quant_validation import runtime as wire
+    def node(ref):
+        return ResolvedArtifact(_wire(ref), _payload(foundation, ref))
+    def ref(value):
+        return ArtifactRef(value["artifact_type"], value["schema_version"], value["content_hash"])
+    c = _payload(foundation, candidate_ref)
+    family = node(ref(c["candidate_family_ref"]))
+    manifest = node(ref(family.payload["execution_manifest_ref"]))
+    selection = node(ref(c["selection_declaration_ref"]))
+    outcomes = [node(ref(value)) for value in manifest.payload["task_outcome_refs"]]
+    cutoff = foundation.entries(RESEARCH_EXECUTION_LOG)[-1].entry_ref
+    graph = CandidateGraph(
+        node(candidate_ref), family, manifest, selection,
+        node(ref(selection.payload["selection_policy_ref"])),
+        node(ref(c["selected_trial_declaration_ref"])), node(ref(c["selected_trial_spec_ref"])),
+        outcomes[0], node(ref(outcomes[1].payload["task_ref"]["task_artifact_ref"])), outcomes[1],
+        port.load_completed(c["selected_publication_ref"]), port.load_analysis(c["selected_analysis_ref"]),
+        tuple(record for record, _, _ in wire._sample_entries(foundation)),
+        provenance=VerifiedCandidateProvenance(_wire(candidate_ref), family.ref, family.payload["experiment_ref"], manifest.ref, selection.ref, wire._entry_ref_wire(cutoff)),
     )
+    snapshot_ref = ledger.freeze_snapshot()
+    plan = build_validation_plan(_wire(candidate_ref), _wire(snapshot_ref), policy)
+    plan_ref = wire._publish(foundation, "validation_plan", wire._plan_payload(plan))
+    assessment_ref = ledger.assess_holdout(snapshot_ref, plan.holdout)
+    admission_case = wire._publish(foundation, "validation_case", {"validation_plan_ref": _wire(plan_ref), "case_type": "evidence_integrity"})
+    admission = assess_admission(plan, graph, wire._snapshot_evidence(foundation, snapshot_ref, assessment_ref, policy))
+    admission_ref = wire._publish(foundation, "validation_case_result", wire._case_result_payload(admission_case, admission))
+    oos_case = wire._publish(foundation, "validation_case", {"validation_plan_ref": _wire(plan_ref), "case_type": "out_of_sample"})
+    ledger.reserve(_record(oos_case, "validation"), oos_case)
+    case = port.case("adverse_completed")
+    oos = assess_oos(plan, OosObservation(plan, _wire(oos_case), _wire(oos_case), case["completed"]), AnalysisObservation(plan, _wire(oos_case), case["analysis"]))
+    oos_ref = wire._publish(foundation, "validation_case_result", wire._case_result_payload(oos_case, oos))
+    report = aggregate_validation_report(plan, (admission, oos))
+    report_ref = wire._publish(foundation, "validation_report", wire._report_payload(report, plan_ref, (admission_ref, oos_ref), assessment_ref))
+    return PublishedValidationReport(plan_ref, report_ref)
+
+
+def test_legacy_validation_v1_canonical_bytes_are_frozen(tmp_path: Path) -> None:
+    foundation = LocalFoundation(tmp_path, clock=lambda: ACCEPTED_AT)
+    ledger = SampleConsumptionLedger(foundation)
+    port = RecordingPort(foundation)
+    candidate_ref = _incomplete_candidate(foundation, ledger, port)
+    policy = _policy(port.case("adverse_completed")["derive"]["metric_profile_ref"])
+    result = _historical_wire_report(foundation, ledger, port, candidate_ref, policy)
 
     assert type(result) is PublishedValidationReport
     assert result.validation_plan_ref.content_hash == (
@@ -485,6 +579,7 @@ def test_decision_grade_fixture_publishes_supported_report_and_replays(
         foundation,
         ledger,
         port,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(result) is PublishedValidationReport
@@ -494,7 +589,7 @@ def test_decision_grade_fixture_publishes_supported_report_and_replays(
     assert plan["accepted_backtest_grades"] == ["decision_grade"]
     assert port.completed_v3_calls
     assert port.analysis_v2_calls
-    assert port.derive_calls == 1
+    assert port.derive_calls - port.research_derive_count == 1
     oos = _oos_result_payload(foundation)
     assert oos["outcome"] == "PASS"
     evidence = oos["evidence"]
@@ -526,6 +621,7 @@ def test_decision_grade_fixture_publishes_supported_report_and_replays(
         foundation,
         ledger,
         port,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
     assert replay == result
     assert before == (
@@ -564,11 +660,13 @@ def test_decision_grade_v2_failure_produces_no_report_or_v1_fallback(
         foundation,
         ledger,
         port,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
-    assert result == NoReport(None, "PORT_STATIC_PROOF_MISMATCH")
-    assert foundation.entries(ARTIFACT_LOG) == ()
-    assert port.run_requests == []
+    assert type(result) is NoReport
+    assert result.reason_code == "PORT_STATIC_PROOF_MISMATCH"
+    assert not any(item["artifact_type"] == "validation_report" for item in _artifact_payloads(foundation))
+    assert len(port.run_requests[port.research_run_count:]) == 1
 
 
 @pytest.mark.parametrize(
@@ -597,10 +695,11 @@ def test_terminal_and_provider_failures_never_derive_and_only_failures_have_no_r
         foundation,
         ledger,
         port,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
-    assert port.run_sample_counts == [3]
-    assert port.derive_calls == 0
+    assert port.run_sample_counts[port.research_run_count:] == [3]
+    assert port.derive_calls - port.research_derive_count == 0
     assert _oos_result_payload(foundation)["outcome"] == outcome
     if report_result is None:
         assert type(result) is NoReport
@@ -640,6 +739,7 @@ def test_valid_inconclusive_oos_evidence_is_not_zero_filled(
         foundation,
         ledger,
         port,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(result) is PublishedValidationReport
@@ -675,6 +775,7 @@ def test_snapshot_excludes_later_equal_time_holdout_reservation(
         foundation,
         ledger,
         port,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(result) is PublishedValidationReport
@@ -724,11 +825,12 @@ def test_forged_candidate_stops_before_validation_publication(tmp_path: Path) ->
         foundation,
         ledger,
         port,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert result == NoReport(None, "CANDIDATE_PROVENANCE_INVALID")
     assert foundation.entries(ARTIFACT_LOG) == ()
-    assert port.run_sample_counts == []
+    assert port.run_sample_counts[port.research_run_count:] == []
 
 
 def test_replay_reuses_the_original_plan_and_requires_an_explicit_fresh_run(
@@ -743,6 +845,7 @@ def test_replay_reuses_the_original_plan_and_requires_an_explicit_fresh_run(
         foundation,
         ledger,
         port,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
     assert type(first) is PublishedValidationReport
     before = (
@@ -760,6 +863,7 @@ def test_replay_reuses_the_original_plan_and_requires_an_explicit_fresh_run(
         foundation,
         ledger,
         port,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert replay == first
@@ -779,6 +883,7 @@ def test_replay_reuses_the_original_plan_and_requires_an_explicit_fresh_run(
         ledger,
         port,
         fresh=True,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
     assert type(fresh) is PublishedValidationReport
     assert fresh.validation_plan_ref != first.validation_plan_ref
@@ -805,10 +910,11 @@ def test_foundation_failure_during_candidate_resolution_propagates(
             foundation,
             ledger,
             port,
+            candidate_provenance_verifier=verify_candidate_provenance,
         )
     assert raised.value.code == "WRITE_LOCK_UNAVAILABLE"
     assert foundation.entries(ARTIFACT_LOG) == ()
-    assert port.run_sample_counts == []
+    assert port.run_sample_counts[port.research_run_count:] == []
 
 
 def test_runtime_uses_no_research_or_backtest_adapter_import() -> None:
@@ -834,3 +940,26 @@ def test_runtime_uses_no_research_or_backtest_adapter_import() -> None:
     assert not any(name.startswith("tests") for name in imports)
     assert "Protocol" not in source
     assert "InMemoryBacktestConsumerPort" not in source
+
+
+def test_missing_verifier_fails_closed_before_io(tmp_path, monkeypatch):
+    foundation, ledger, port, candidate_ref, policy = _setup(tmp_path)
+    def forbidden(*args, **kwargs):
+        pytest.fail("missing verifier performed I/O")
+    for name in ("read", "entries", "put", "append", "checkpoint"):
+        monkeypatch.setattr(foundation, name, forbidden)
+    assert validate_candidate(candidate_ref, policy, {}, RESERVED_AT, foundation, ledger, port) == NoReport(None, "CANDIDATE_PROVENANCE_INVALID")
+
+
+def test_replay_rejects_unbacked_supported_report(tmp_path):
+    foundation, ledger, port, candidate_ref, policy = _setup(tmp_path)
+    first = validate_candidate(candidate_ref, policy, {"fixture_case": "provider_failure"}, RESERVED_AT, foundation, ledger, port, candidate_provenance_verifier=verify_candidate_provenance)
+    assert type(first) is NoReport and first.validation_plan_ref is not None
+    _publish(foundation, ARTIFACT_LOG, "validation_report", {
+        "validation_plan_ref": _wire(first.validation_plan_ref), "result": "supported",
+        "case_result_refs": [], "threshold_evaluations": [],
+        "sample_integrity_ref": _wire(candidate_ref), "limitations": [],
+    })
+    before = (len(foundation.entries(ARTIFACT_LOG)), len(foundation.entries(SAMPLE_LOG)), len(port.run_requests), port.derive_calls)
+    assert validate_candidate(candidate_ref, policy, {}, RESERVED_AT, foundation, ledger, port, candidate_provenance_verifier=verify_candidate_provenance) == NoReport(None, "CANDIDATE_PROVENANCE_INVALID")
+    assert before == (len(foundation.entries(ARTIFACT_LOG)), len(foundation.entries(SAMPLE_LOG)), len(port.run_requests), port.derive_calls)

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from crypto_quant_research import verify_candidate_provenance
 from crypto_quant_domain import (
     ArtifactEnvelope,
     ArtifactRef,
@@ -177,6 +178,7 @@ def test_real_model_candidate_preserves_rejected_oos_report_and_replay(
         foundation,
         ledger,
         provider,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
     second = validate_candidate(
         candidate_ref,
@@ -186,6 +188,7 @@ def test_real_model_candidate_preserves_rejected_oos_report_and_replay(
         foundation,
         ledger,
         provider,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(first) is PublishedValidationReport
@@ -211,6 +214,7 @@ def test_model_candidate_missing_training_reservation_produces_no_report(
         foundation,
         ledger,
         provider,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(result) is NoReport
@@ -243,6 +247,7 @@ def test_model_candidate_substituted_build_evidence_produces_no_report(
         foundation,
         ledger,
         provider,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(result) is NoReport
@@ -262,6 +267,7 @@ def test_real_candidate_publishes_rejected_oos_report_and_replays(tmp_path: Path
         foundation,
         ledger,
         provider,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
     after_first_runs = provider.run_calls
     second = validate_candidate(
@@ -272,6 +278,7 @@ def test_real_candidate_publishes_rejected_oos_report_and_replays(tmp_path: Path
         foundation,
         ledger,
         provider,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(first) is PublishedValidationReport
@@ -302,6 +309,7 @@ def test_real_blocked_oos_remains_inconclusive(tmp_path: Path) -> None:
         foundation,
         ledger,
         provider,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(result) is PublishedValidationReport
@@ -327,6 +335,7 @@ def test_real_candidate_repository_failure_produces_no_report(
         foundation,
         ledger,
         provider,
+        candidate_provenance_verifier=verify_candidate_provenance,
     )
 
     assert type(result) is NoReport

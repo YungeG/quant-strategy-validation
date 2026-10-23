@@ -26,6 +26,7 @@ from crypto_quant_validation import (  # noqa: E402
     ValidationCoreFailure,
     ValidationPlan,
     ValidationPolicy,
+    VerifiedCandidateProvenance,
     aggregate_validation_report,
     assess_admission,
     assess_oos,
@@ -97,9 +98,13 @@ def _policy(metric_profile_ref: object) -> ValidationPolicy:
     )
 
 
+
+def _consumer_ref(kind):
+    return {"type": "artifact_ref", "artifact_type": kind, "schema_version": 1, "content_hash": HEAD}
+
 def _plan(metric_profile_ref: object) -> ValidationPlan:
     return build_validation_plan(
-        "candidate:selected",
+        _consumer_ref("strategy_candidate"),
         "snapshot:pre-oos",
         _policy(metric_profile_ref),
     )
@@ -114,10 +119,10 @@ def _candidate_graph(
     completed: dict,
     analysis: dict,
 ) -> CandidateGraph:
-    experiment_ref = "experiment:one"
-    family_ref = "family:one"
-    manifest_ref = "manifest:one"
-    selection_ref = "selection:one"
+    experiment_ref = _consumer_ref("experiment_spec")
+    family_ref = _consumer_ref("candidate_family")
+    manifest_ref = _consumer_ref("experiment_execution_manifest")
+    selection_ref = _consumer_ref("selection_declaration")
     policy_ref = "selection-policy:one"
     trial_ref = "trial:t10-1"
     trial_spec_ref = "trial-spec:t10-1"
@@ -131,7 +136,7 @@ def _candidate_graph(
 
     return CandidateGraph(
         candidate=_node(
-            "candidate:selected",
+            _consumer_ref("strategy_candidate"),
             {
                 "candidate_family_ref": family_ref,
                 "selection_declaration_ref": selection_ref,
@@ -242,6 +247,11 @@ def _candidate_graph(
         selected_completed=completed,
         selected_analysis=analysis,
         required_sample_records=required,
+        # Consumer-only kernel fixture, not Research provenance evidence.
+        provenance=VerifiedCandidateProvenance(
+            plan.candidate_ref, family_ref, experiment_ref, manifest_ref, selection_ref,
+            {"log_name": "research.execution.v1", "log_sequence": 1, "receipt_hash": HEAD},
+        ),
     )
 
 
@@ -603,3 +613,20 @@ def test_core_imports_no_foundation_research_or_backtest_runtime() -> None:
     assert not any(name.startswith("backtest") for name in imports)
     assert "Protocol" not in source
     assert "simulation" not in source.lower()
+
+
+@pytest.mark.parametrize("field", ["candidate", "candidate_family", "execution_manifest", "selection_declaration"])
+def test_consumer_graph_binding_rejects_boolean_ref_versions(field):
+    plan, graph, _, _, _ = _admitted()
+    original = getattr(graph, field)
+    ref = dict(original.ref)
+    ref["schema_version"] = True
+    changed = replace(graph, **{field: ResolvedArtifact(ref, original.payload)})
+    result = assess_admission(plan, changed, _sample_evidence(plan, graph.required_sample_records))
+    assert result.reason_codes == ("CANDIDATE_PROVENANCE_INVALID",)
+
+
+def test_consumer_graph_requires_explicit_provenance_binding():
+    plan, graph, _, _, _ = _admitted()
+    result = assess_admission(plan, replace(graph, provenance=None), _sample_evidence(plan, graph.required_sample_records))
+    assert result.reason_codes == ("CANDIDATE_PROVENANCE_INVALID",)

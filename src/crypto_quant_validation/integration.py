@@ -583,6 +583,7 @@ class CandidateGraph:
     selected_analysis: dict[str, Any] | None
     required_sample_records: tuple[SampleConsumptionRecord, ...]
     model_build: ModelBuildGraph | None = None
+    provenance: VerifiedCandidateProvenance | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -1301,6 +1302,22 @@ def _model_build_graph_valid(
 
 def _candidate_graph_status(plan: ValidationPlan, graph: object) -> str:
     if type(graph) is not CandidateGraph:
+        return "invalid"
+    provenance = graph.provenance
+    if type(provenance) is not VerifiedCandidateProvenance:
+        return "invalid"
+    bindings = (
+        (provenance.candidate_ref, graph.candidate.ref),
+        (provenance.candidate_family_ref, graph.candidate_family.ref),
+        (provenance.execution_manifest_ref, graph.execution_manifest.ref),
+        (provenance.selection_declaration_ref, graph.selection_declaration.ref),
+    )
+    if graph.candidate_family.payload is not None:
+        bindings += ((provenance.experiment_ref, graph.candidate_family.payload.get("experiment_ref")),)
+    try:
+        if any(_wire_key(dict(bound)) != _wire_key(actual) for bound, actual in bindings):
+            return "invalid"
+    except ValueError:
         return "invalid"
     candidate_fields = (
         _CANDIDATE_FIELDS

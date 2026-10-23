@@ -37,7 +37,7 @@ from .retrospective_reservation import (
     RetrospectiveReservationReceipt,
     reserve_retrospective_read,
 )
-from .runtime import NoReport, PublishedValidationReport, validate_candidate
+from .runtime import CandidateProvenanceVerifier, NoReport, PublishedValidationReport, validate_candidate
 from .sample_consumption import (
     SampleConsumptionRecord,
     SampleConsumptionSnapshot,
@@ -60,6 +60,7 @@ __all__ = [
     "PAIRED_PORTFOLIO_COMPARISON_FAILURE_PRECEDENCE",
     "AnalysisObservation",
     "CandidateGraph",
+    "CandidateProvenanceVerifier",
     "CaseResult",
     "CompletedCaseEvidence",
     "DecisionRule",
