@@ -497,6 +497,7 @@ def _candidate_graph(
                 _ref_from_wire(family_payload["experiment_ref"]),
                 "experiment_spec",
                 _RESEARCH_ARTIFACT_LOG,
+                schema_versions=(1, 3),
             )
             model_build = ModelBuildGraph(
                 experiment,

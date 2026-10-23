@@ -133,6 +133,7 @@ _EXPERIMENT_FIELDS = {
     "metric_profile_refs",
     "budget",
 }
+_EXPERIMENT_V3_FIELDS = _EXPERIMENT_FIELDS | {"evaluation_slices"}
 _FEATURE_RECIPE_FIELDS = {
     "feature_key",
     "feature_code_hash",
@@ -540,7 +541,7 @@ class VerifiedCandidateProvenance:
         kinds = {
             "candidate_ref": ("strategy_candidate", (1, 2, 3)),
             "candidate_family_ref": ("candidate_family", (1,)),
-            "experiment_ref": ("experiment_spec", (1, 2)),
+            "experiment_ref": ("experiment_spec", (1, 2, 3)),
             "execution_manifest_ref": ("experiment_execution_manifest", (1,)),
             "selection_declaration_ref": ("selection_declaration", (1,)),
         }
@@ -1139,8 +1140,17 @@ def _model_build_graph_valid(
     completed: dict[str, Any],
     required: tuple[SampleConsumptionRecord, ...],
 ) -> bool:
+    ref = graph.experiment_spec.ref
+    version = ref.get("schema_version") if type(ref) is dict else None
+    if (
+        type(version) is not int
+        or version not in (1, 3)
+        or not _artifact_ref_matches(ref, "experiment_spec", version)
+    ):
+        return False
+    experiment_fields = _EXPERIMENT_FIELDS if version == 1 else _EXPERIMENT_V3_FIELDS
     nodes = (
-        (graph.experiment_spec, _EXPERIMENT_FIELDS),
+        (graph.experiment_spec, experiment_fields),
         (graph.feature_recipe, _FEATURE_RECIPE_FIELDS),
         (graph.trainer_recipe, _TRAINER_RECIPE_FIELDS),
         (graph.model_build_plan, _MODEL_BUILD_PLAN_FIELDS),

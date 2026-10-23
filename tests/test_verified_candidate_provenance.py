@@ -31,7 +31,8 @@ def test_copies_and_freezes_canonical_identity_values():
 @pytest.mark.parametrize("field,change", [
     ("candidate_ref", {"schema_version": 4}),
     ("candidate_ref", {"schema_version": True}),
-    ("experiment_ref", {"schema_version": 3}),
+    ("experiment_ref", {"schema_version": 4}),
+    ("experiment_ref", {"schema_version": True}),
     ("execution_manifest_ref", {"artifact_type": "strategy_candidate"}),
     ("selection_declaration_ref", {"content_hash": "bad"}),
     ("manifest_cutoff_ref", {"log_sequence": 0}),
@@ -47,7 +48,7 @@ def test_rejects_invalid_bindings(field, change):
         VerifiedCandidateProvenance(**values)
 
 
-@pytest.mark.parametrize("candidate,experiment", [(1, 1), (2, 1), (3, 2)])
+@pytest.mark.parametrize("candidate,experiment", [(1, 1), (2, 1), (3, 2), (2, 3)])
 def test_historical_candidate_and_experiment_versions(candidate, experiment):
     values = _values()
     values["candidate_ref"]["schema_version"] = candidate

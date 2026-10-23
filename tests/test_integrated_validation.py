@@ -117,6 +117,27 @@ def _runtime(tmp_path: Path, *, market: bool = True):
     )
 
 
+def _model_policy(profile_ref):
+    _, _, reader = _RESEARCH._BINDING_MODULE._model_case("validation:oos:model", scope="oos")
+    ordinary = _policy(profile_ref)
+    return ValidationPolicy(
+        accepted_backtest_grades=ordinary.accepted_backtest_grades,
+        accepted_metric_profile_refs=ordinary.accepted_metric_profile_refs,
+        holdout=Holdout(reader.bundle_ref.to_canonical_dict(), "model-evaluation-synthetic-oos-v1",
+                        "1970-01-01T00:00:00.000004Z", "1970-01-01T00:00:00.000005Z", "HOLDOUT", False),
+        oos_rule=ordinary.oos_rule,
+    )
+
+
+def _prepare_model_oos(foundation, publication_root, provider, artifact):
+    # Inert configuration: the scoped provider materializes only after OOS reservation.
+    return {
+        "publication_root": str(publication_root),
+        "model_key": artifact.model_key,
+        "artifact_ref_hash": artifact.artifact_ref_hash,
+    }
+
+
 def _model_runtime(tmp_path: Path, *, missing_training_reservation: bool = False):
     foundation, ledger, builder, provider, research_inputs, artifact = (
         _RESEARCH._model_runtime(tmp_path / "research")
@@ -140,17 +161,7 @@ def _model_runtime(tmp_path: Path, *, missing_training_reservation: bool = False
     assert type(candidate) is _RESEARCH.PublishedStrategyCandidate
     selected = _payload(foundation, candidate.strategy_candidate_ref)
     profile_ref = _plain(research_inputs.experiment_spec.metric_profile_refs[0])
-    prepared = _RESEARCH.backtest.prepare_model_bound_cash_development_backtest(
-        request_intent=_RESEARCH._BINDING_MODULE._intent("validation:oos:model"),
-        provider_inputs=_RESEARCH._BINDING_MODULE._provider_inputs(),
-        model_timeline=provider._timeline,
-        expected_model_key=artifact.model_key,
-        expected_artifact_ref_hash=artifact.artifact_ref_hash,
-        artifact_reader=foundation,
-        artifact_publisher=foundation,
-        market_reader=_RESEARCH._BINDING_MODULE._market_reader(),
-        publication_root=tmp_path / "research/publications",
-    )
+    prepared = _prepare_model_oos(foundation, tmp_path / "research/publications", provider, artifact)
     provider._prepared["validation:oos:model"] = prepared
     return (
         foundation,
@@ -158,7 +169,7 @@ def _model_runtime(tmp_path: Path, *, missing_training_reservation: bool = False
         provider,
         candidate.strategy_candidate_ref,
         selected,
-        _policy(profile_ref),
+        _model_policy(profile_ref),
     )
 
 
@@ -180,6 +191,9 @@ def test_real_model_candidate_preserves_rejected_oos_report_and_replay(
         provider,
         candidate_provenance_verifier=verify_candidate_provenance,
     )
+    oos_prepared = provider._prepared["validation:oos:model"]
+    source_reads = provider.source_read_calls
+    ledger_before_replay = foundation.entries("validation.sample-consumption.v1")
     second = validate_candidate(
         candidate_ref,
         policy,
@@ -193,9 +207,20 @@ def test_real_model_candidate_preserves_rejected_oos_report_and_replay(
 
     assert type(first) is PublishedValidationReport
     assert second == first
+    assert provider._prepared["validation:oos:model"] is oos_prepared
+    assert provider.source_read_calls == source_reads
+    assert provider.oos_prepare_calls == 1
+    assert foundation.entries("validation.sample-consumption.v1") == ledger_before_replay
     assert provider.run_calls == runs + 1
     assert _payload(foundation, first.validation_report_ref)["result"] == "rejected"
     assert "model_build_evidence_ref" in selected
+    prepared = provider._prepared["validation:oos:model"]
+    assert type(prepared) is not dict
+    publications = [ref for ref in provider._refs.values()
+                    if type(ref) is _RESEARCH.backtest.AnalysisArtifactRef]
+    analyses = [provider.load_analysis(_plain(ref)) for ref in publications]
+    assert analyses[-1]["trade_count"] == 1
+    assert analyses[-1]["simple_period_return"] == "-0.1"
 
 
 def test_model_candidate_missing_training_reservation_produces_no_report(
@@ -344,3 +369,49 @@ def test_real_candidate_repository_failure_produces_no_report(
         "PORT_RETENTION_UNAVAILABLE",
     }
     assert provider.run_calls == runs
+
+
+def test_model_experiment3_exact_graph_fields_fail_closed(tmp_path):
+    from copy import deepcopy
+    from dataclasses import replace
+    from crypto_quant_validation.integration import assess_admission, build_validation_plan
+    from crypto_quant_validation.runtime import _candidate_graph
+    foundation, ledger, provider, ref, _, policy = _model_runtime(tmp_path)
+    graph, _ = _candidate_graph(ref, foundation, provider, _RESERVED_AT,
+                             candidate_provenance_verifier=verify_candidate_provenance)
+    plan = build_validation_plan(_plain(ref), _plain(ledger.freeze_snapshot()), policy)
+    experiment = graph.model_build.experiment_spec
+    assert experiment.ref['schema_version'] == 3
+    for mode in ('missing', 'extra', 'legacy'):
+        payload = deepcopy(experiment.payload)
+        changed_ref = dict(experiment.ref)
+        if mode == 'missing':
+            del payload['evaluation_slices']
+        elif mode == 'extra':
+            payload['extra'] = 1
+        else:
+            changed_ref['schema_version'] = 1
+        mutated = replace(graph, model_build=replace(graph.model_build,
+                          experiment_spec=replace(experiment, ref=changed_ref, payload=payload)))
+        result = assess_admission(plan, mutated, None)
+        assert result.outcome == 'FAILED'
+        assert result.reason_codes == ('CANDIDATE_PROVENANCE_INVALID',)
+
+
+def test_model_oos_reservation_failure_prevents_deferred_prepare(tmp_path, monkeypatch):
+    foundation, ledger, provider, ref, _, policy = _model_runtime(tmp_path)
+    original = ledger.reserve
+    error = RuntimeError('OOS reservation failure')
+    def reserve(record, producer):
+        if record.purpose == 'validation':
+            raise error
+        return original(record, producer)
+    ledger.reserve = reserve
+    def forbidden(*args, **kwargs):
+        pytest.fail('reservation failure must prevent preparation')
+    monkeypatch.setattr(_RESEARCH.backtest, 'prepare_model_bound_cash_development_backtest', forbidden)
+    with pytest.raises(RuntimeError) as caught:
+        validate_candidate(ref, policy, {'binding_key': 'validation:oos:model'}, _RESERVED_AT,
+                           foundation, ledger, provider, candidate_provenance_verifier=verify_candidate_provenance)
+    assert caught.value is error
+    assert type(provider._prepared['validation:oos:model']) is dict
