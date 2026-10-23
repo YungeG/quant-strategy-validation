@@ -1334,3 +1334,78 @@ def test_closed_report_replay_preserves_assessment_infrastructure_failure(tmp_pa
     with pytest.raises(FoundationFailure) as caught:
         validate_target_candidate(*args, candidate_provenance_verifier=verify_candidate_provenance)
     assert caught.value.code == "WRITE_LOCK_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    ("artifact_type", "code"),
+    (
+        ("validation_report", "WRITE_LOCK_UNAVAILABLE"),
+        ("validation_case", "ARTIFACT_NOT_FOUND"),
+    ),
+    ids=("unavailable_report", "missing_admission_case"),
+)
+def test_closed_report_replay_classifies_foundation_read_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_type: str,
+    code: str,
+) -> None:
+    from crypto_quant_foundation import FoundationFailure
+
+    foundation, ledger, materializer, backtest, candidate = _runtime(tmp_path)
+    args = (
+        candidate.strategy_candidate_ref,
+        _policy(),
+        _RESEARCH.RESERVED_AT,
+        foundation,
+        ledger,
+        materializer,
+        backtest,
+    )
+    first = validate_target_candidate(
+        *args, candidate_provenance_verifier=verify_candidate_provenance
+    )
+    assert type(first) is PublishedValidationReport
+    admission_case_ref = target_runtime._case_ref(
+        first.validation_plan_ref, "evidence_integrity"
+    )
+    fault_ref = (
+        first.validation_report_ref
+        if artifact_type == "validation_report"
+        else admission_case_ref
+    )
+    read = foundation.read
+    error = FoundationFailure(code)
+    fault_reads = []
+
+    def unavailable(*, ref):
+        if ref == fault_ref:
+            fault_reads.append(ref)
+            raise error
+        return read(ref=ref)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("closed target replay performed a write, clock, or economic operation")
+
+    monkeypatch.setattr(foundation, "read", unavailable)
+    for owner, operations in (
+        (foundation, ("put", "append", "checkpoint", "_clock")),
+        (ledger, ("reserve", "freeze_snapshot", "assess_holdout")),
+        (materializer, ("materialize_target",)),
+        (backtest, ("prepare_target", "run", "derive")),
+    ):
+        for operation in operations:
+            monkeypatch.setattr(owner, operation, forbidden)
+
+    if code == "ARTIFACT_NOT_FOUND":
+        result = validate_target_candidate(
+            *args, candidate_provenance_verifier=verify_candidate_provenance
+        )
+        assert result == NoReport(first.validation_plan_ref, "CASE_COVER_INVALID")
+    else:
+        with pytest.raises(FoundationFailure) as caught:
+            validate_target_candidate(
+                *args, candidate_provenance_verifier=verify_candidate_provenance
+            )
+        assert caught.value is error
+    assert fault_reads == [fault_ref]

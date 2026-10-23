@@ -870,6 +870,8 @@ def _existing_report(
             != payload
         ):
             raise ValueError("ValidationReport@2 is invalid")
+    except FoundationFailure:
+        raise
     except Exception as error:
         raise ValueError("ValidationReport@2 is invalid") from error
     return PublishedValidationReport(plan_ref, report_ref)
@@ -1662,7 +1664,9 @@ def validate_target_candidate(
                 reservation_at,
                 backtest,
             )
-        except FoundationFailure:
+        except FoundationFailure as error:
+            if error.code == "ARTIFACT_NOT_FOUND":
+                return NoReport(plan_ref, "CASE_COVER_INVALID")
             raise
         except _OosReservationConflict:
             return NoReport(plan_ref, "SAMPLE_LEDGER_CONFLICT")
