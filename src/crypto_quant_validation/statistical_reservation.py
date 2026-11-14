@@ -106,6 +106,7 @@ _PHASES = {
     ),
 }
 _PURPOSES = {
+    "input_qualification_read_task": "discovery",
     "feature_build_task": "feature_build",
     "model_training_task": "model_training",
     "trial_declaration": "discovery",

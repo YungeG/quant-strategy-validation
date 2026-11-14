@@ -1,3 +1,11 @@
+from .input_qualification_reservation import (
+    InputQualificationCaptureViewV1,
+    InputQualificationError,
+    InputQualificationFailureCodeV1,
+    InputQualificationReadBindingV1,
+    InputQualificationReservationReceiptV1,
+    InputQualificationVerifierV1,
+)
 from .integration import (
     FAILURE_PRECEDENCE,
     AnalysisObservation,
@@ -55,7 +63,18 @@ from .target_runtime import (
     validate_target_candidate,
 )
 
+from .reporting import describe_validation_return, read_validation_outcome_view
+
 __all__ = [
+    "InputQualificationCaptureViewV1",
+    "InputQualificationError",
+    "InputQualificationFailureCodeV1",
+    "InputQualificationReadBindingV1",
+    "InputQualificationReservationReceiptV1",
+    "InputQualificationVerifierV1",
+
+    "describe_validation_return",
+    "read_validation_outcome_view",
     "FAILURE_PRECEDENCE",
     "PAIRED_PORTFOLIO_COMPARISON_FAILURE_PRECEDENCE",
     "AnalysisObservation",

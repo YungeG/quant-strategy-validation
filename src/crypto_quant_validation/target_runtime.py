@@ -4,7 +4,7 @@ import json
 import re
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Callable
 
 from crypto_quant_domain import (
     ArtifactEnvelope,
@@ -27,6 +27,7 @@ from .integration import (
     assess_oos,
     build_validation_plan,
 )
+from .input_qualification_reservation import _event as _input_qualification_event
 from .ledger import SampleConsumptionLedger
 from .runtime import (
     CandidateProvenanceVerifier,
@@ -423,10 +424,17 @@ def _entries(
             )
             ref = ArtifactRef.from_envelope(envelope)
             payload = _plain(envelope.payload)
+            if log_name == _RESEARCH_ARTIFACT_LOG and envelope.artifact_type in {
+                "input_qualification_declaration",
+                "input_qualification_read_task",
+                "input_qualification_capture_binding",
+            }:
+                expected_event = _input_qualification_event(envelope)
+            else:
+                expected_event = canonical_sha256(("artifact-publication-v1", log_name, ref))
             if (
                 canonical_bytes(envelope) != entry.payload
-                or entry.event_id
-                != canonical_sha256(("artifact-publication-v1", log_name, ref))
+                or entry.event_id != expected_event
                 or type(payload) is not dict
             ):
                 raise ValueError("owner publication is invalid")
@@ -530,7 +538,29 @@ def _verified_target(
 ) -> dict[str, Any]:
     try:
         target_ref = _canonical_target_ref(target_ref)
-        loaded = _plain(backtest.load_target(deepcopy(target_ref)))
+        loaded = backtest.load_target(deepcopy(target_ref))
+        return _verify_loaded_target(
+            loaded, target_ref, producer_context_ref,
+            expected_digest=expected_digest,
+            expected_event_count=expected_event_count,
+            expected_stream=expected_stream,
+        )
+    except Exception as error:
+        raise ValueError("TARGET_STORE_INVALID") from error
+
+
+def _verify_loaded_target(
+    loaded_record: object,
+    target_ref: object,
+    producer_context_ref: ArtifactRef,
+    *,
+    expected_digest: str,
+    expected_event_count: int,
+    expected_stream: object | None = None,
+) -> dict[str, Any]:
+    try:
+        target_ref = _canonical_target_ref(target_ref)
+        loaded = _plain(loaded_record)
         if type(loaded) is not dict or set(loaded) != {
             "ref",
             "producer_context_ref",
@@ -580,6 +610,22 @@ def _target_context(
     reservation_at: str,
     candidate_provenance_verifier: CandidateProvenanceVerifier,
 ):
+    return _target_context_with_loader(
+        candidate_ref, foundation, backtest, reservation_at,
+        candidate_provenance_verifier, _verified_target,
+    )
+
+
+def _target_context_with_loader(
+    candidate_ref: ArtifactRef,
+    foundation: LocalFoundation,
+    backtest: Any,
+    reservation_at: str,
+    candidate_provenance_verifier: CandidateProvenanceVerifier,
+    verify_target: Callable[..., dict[str, Any]],
+):
+    # Reporting supplies a loader that preserves infrastructure exceptions;
+    # execution retains the original TARGET_STORE_INVALID normalization.
     candidate = _published(
         foundation,
         candidate_ref,
@@ -708,7 +754,7 @@ def _target_context(
     if type(event_count) is not int or event_count < 0:
         raise ValueError("discovery event_count is invalid")
     discovery_ref = _canonical_target_ref(evidence["target_stream_ref"])
-    _verified_target(
+    verify_target(
         backtest,
         discovery_ref,
         trial_ref,
@@ -1147,6 +1193,28 @@ def _existing_evidence(
     context: _TargetContext,
     reservation_at: str,
 ) -> tuple[ArtifactRef, ValidationTargetMaterializationEvidence] | None:
+    recovered = _existing_evidence_metadata(
+        foundation, candidate_ref, case_ref, policy, context, reservation_at,
+    )
+    if recovered is not None:
+        _, evidence = recovered
+        _verified_target(
+            backtest, evidence.target_stream_ref, case_ref,
+            expected_digest=evidence.target_stream_digest,
+            expected_event_count=evidence.event_count,
+        )
+    return recovered
+
+
+def _existing_evidence_metadata(
+    foundation: LocalFoundation,
+    candidate_ref: ArtifactRef,
+    case_ref: ArtifactRef,
+    policy: ValidationPolicy,
+    context: _TargetContext,
+    reservation_at: str,
+) -> tuple[ArtifactRef, ValidationTargetMaterializationEvidence] | None:
+    """Verify original links and reservation; caller must also cold-verify the target."""
     matches: list[tuple[Any, ArtifactRef, dict[str, Any]]] = []
     for entry, ref, payload in _entries(foundation, _ARTIFACT_LOG):
         if (
@@ -1188,13 +1256,6 @@ def _existing_evidence(
         policy,
         reservation_at,
         before_ledger_sequence=entry.ledger_sequence,
-    )
-    _verified_target(
-        backtest,
-        evidence.target_stream_ref,
-        case_ref,
-        expected_digest=evidence.target_stream_digest,
-        expected_event_count=evidence.event_count,
     )
     return ref, evidence
 

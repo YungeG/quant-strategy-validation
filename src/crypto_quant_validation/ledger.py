@@ -27,6 +27,7 @@ _SNAPSHOT_TYPE = "sample_consumption_ledger_snapshot"
 _ASSESSMENT_TYPE = "sample_integrity_assessment"
 _HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _PURPOSE_BY_PRODUCER = {
+    "input_qualification_read_task": "discovery",
     "feature_build_task": "feature_build",
     "model_training_task": "model_training",
     "trial_declaration": "discovery",
